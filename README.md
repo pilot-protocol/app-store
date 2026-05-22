@@ -1,5 +1,9 @@
 # app-store
 
+[![ci](https://github.com/pilot-protocol/app-store/actions/workflows/ci.yml/badge.svg)](https://github.com/pilot-protocol/app-store/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/pilot-protocol/app-store/branch/main/graph/badge.svg)](https://codecov.io/gh/pilot-protocol/app-store)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+
 Extension framework for the Pilot Protocol. Defines the manifest schema,
 grant policy engine, and IPC contract that let third-party apps plug
 into a Pilot daemon with capability-scoped access to peer messaging,
@@ -54,3 +58,7 @@ The daemon embeds a catalog public key; the catalog signs each manifest;
 each manifest pins its binary's sha256; the daemon re-verifies the
 binary on every launch and brokers IPC calls only when the user has
 explicitly accepted the app's declared grants.
+
+## License
+
+AGPL-3.0-or-later. See [LICENSE](LICENSE).
