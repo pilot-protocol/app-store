@@ -1,40 +1,56 @@
-# pilot-app-store
+# app-store
 
-Isolated implementation of the Pilot app store. Independent module, independent tests, designed to be pulled into pilot as a plugin via `git subtree` (or merged) once it stabilizes.
+Extension framework for the Pilot Protocol. Defines the manifest schema,
+grant policy engine, and IPC contract that let third-party apps plug
+into a Pilot daemon with capability-scoped access to peer messaging,
+identity, and storage primitives.
 
-## What lives here
+## Install
 
-```
-pkg/
-  manifest/    typed manifest schema + validator
-  grants/      grant policy engine (cap conditions: rate, cap, allowlist, ...)
-  derive/      HKDF-based per-app key derivation
-  ipc/         the new IPC commands (CmdAppHello, CmdAppSign, ...)
-  runtime/     app supervisor — spawns app processes, brokers their calls
-  store/       store.pilot client + catalog types
-plugin/
-  plugin.go    pilot.Service implementation (the bridge into pilot's plugin registry)
-examples/
-  *.manifest.json  real-shaped manifests for the launch apps
-cmd/
-  pilotctl-app/    standalone CLI for app management (eventually merged into pilotctl)
+```go
+import "github.com/pilot-protocol/app-store"
 ```
 
-The architecture model this implements lives in `../docs/architecture/graph.json`. Anything that disagrees between code and that graph is a bug in one of the two — they should be kept in sync.
+## Usage
 
-## How to test
+```go
+import (
+    "github.com/pilot-protocol/app-store/pkg/manifest"
+    "github.com/pilot-protocol/app-store/plugin/appstore"
+)
+
+// Load + validate an app manifest.
+m, err := manifest.Load("examples/wallet.manifest.json")
+if err != nil { return err }
+if err := manifest.Validate(m); err != nil { return err }
+
+// Construct the appstore plugin for the daemon's runtime registry.
+svc := appstore.NewService(appstore.Config{
+    InstallRoot:   "~/.pilot/apps",
+    CatalogPubkey: appstore.EmbeddedCatalogPubkey,
+})
+```
+
+Run the tests:
 
 ```bash
-cd app-store
 go test ./...
 ```
 
-## Why isolated?
+## Layout
 
-- Build the runtime against mocks of pilot's primitives (root identity, send-message, peer discovery) so the inner loop is fast.
-- The plugin bridge (`plugin/plugin.go`) is the only file that touches real pilot types; everything else is testable without bringing pilot in.
-- When the runtime is solid, the bridge gets wired into `pilots`/daemon's plugin registry — a single integration commit.
+| Package | What it does |
+|---|---|
+| `pkg/manifest` | Typed manifest schema + validator. |
+| `pkg/extend`   | Open-namespace pre/post hooks on any command; runtime registration gated by manifest declarations. |
+| `pkg/ipc`      | IPC commands (`CmdAppHello`, `CmdAppSign`, …) and framing. |
+| `pkg/payment`  | `Method`, `Escrow`, `Seal` interfaces; default chacha20-poly1305 seal. |
+| `plugin/appstore` | The `coreapi.Service` plugin: scans install root, verifies sha256, supervises child app processes, brokers peer-app IPC calls. |
+| `integration`  | Adapter that pins `*Service` against the daemon's plugin interface at compile time. |
 
-## Status
+## Trust chain
 
-Phase 1 of the dev plan (per `docs/architecture/graph.json` → development plan view): foundation. Building manifest, grants, derive, ipc, runtime in that order.
+The daemon embeds a catalog public key; the catalog signs each manifest;
+each manifest pins its binary's sha256; the daemon re-verifies the
+binary on every launch and brokers IPC calls only when the user has
+explicitly accepted the app's declared grants.

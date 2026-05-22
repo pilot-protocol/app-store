@@ -2,11 +2,12 @@
 // inside the pilot daemon. It implements coreapi.Service (Name/Order/Start/
 // Stop) and wraps the supervisor that spawns + brokers every installed app.
 //
-// The shim does not import github.com/web4/pilot directly to keep the
-// app-store module self-buildable. The Service type's method shapes are
-// nominally identical to coreapi.Service; web4's main.go can register
-// *Service against the interface without an explicit adapter as long as
-// the type signatures stay in sync. (See INTEGRATION.md for the contract.)
+// The shim does not import the daemon's coreapi package directly, so the
+// app-store module stays self-buildable. The Service type's method shapes
+// are nominally identical to coreapi.Service; the daemon's main.go can
+// register *Service against the interface without an explicit adapter as
+// long as the type signatures stay in sync. (See INTEGRATION.md for the
+// contract.)
 package appstore
 
 import (
@@ -114,7 +115,7 @@ func (s *Service) Order() int { return 120 }
 // Deps is the duck-typed shape of coreapi.Deps the daemon hands plugins.
 // Kept independent of the real coreapi package so app-store stays
 // self-buildable; the field names + signatures must match
-// pkg/coreapi/lifecycle.go in web4 exactly.
+// pkg/coreapi/lifecycle.go exactly.
 //
 // When the daemon's main.go registers *Service it passes the real coreapi.Deps;
 // Go's structural typing makes this work as long as the methods used here
@@ -136,7 +137,7 @@ type Deps struct {
 //
 // In tick 5 this is a skeleton: directory walk + log lines, no actual
 // spawn. The supervisor wire-up happens in tick 6 when we have a real
-// integration test against web4's coreapi.
+// integration test against the daemon's coreapi.
 func (s *Service) Start(ctx context.Context, deps Deps) error {
 	s.startMu.Lock()
 	defer s.startMu.Unlock()

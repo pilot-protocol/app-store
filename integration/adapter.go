@@ -1,17 +1,13 @@
-// Package integration is the glue layer between the standalone app-store
-// shim and the real pilot daemon. It imports both modules and provides
-// an Adapter that satisfies github.com/TeoSlayer/pilotprotocol/pkg/coreapi.Service
-// by forwarding to *appstore.Service.
+// Package integration is the glue layer between the app-store shim and
+// the pilot daemon. It imports both modules and provides an Adapter that
+// satisfies github.com/TeoSlayer/pilotprotocol/pkg/coreapi.Service by
+// forwarding to *appstore.Service.
 //
 // This package is intentionally *not* part of the main app-store module's
-// go.mod — app-store stays self-buildable. The replace directive in this
-// directory's go.mod points at the local web4 checkout; in a CI / merged
-// world, web4 would consume the merged subtree directly without the
-// adapter.
-//
-// The whole point: compile-time proof that *appstore.Service satisfies
-// the daemon's plugin contract. If web4's coreapi.Service ever drifts
-// from our shim, `go build` here breaks loudly before any web4 edit ships.
+// go.mod — app-store stays self-buildable. The whole point: compile-time
+// proof that *appstore.Service satisfies the daemon's plugin contract.
+// If coreapi.Service ever drifts from the shim, `go build` here breaks
+// loudly.
 package integration
 
 import (
@@ -30,7 +26,7 @@ type Adapter struct {
 
 // New returns an Adapter ready to register with the daemon's runtime.
 //
-// Typical usage in web4 (cmd/daemon/main.go):
+// Typical usage (cmd/daemon/main.go):
 //
 //	rt.Register(integration.New(appstore.NewService(appstore.Config{
 //	    InstallRoot:   ...,
@@ -64,5 +60,5 @@ func (a *Adapter) Stop(ctx context.Context) error { return a.svc.Stop(ctx) }
 
 // Compile-time assertion that *Adapter satisfies coreapi.Service. If
 // the interface ever changes shape this line is the first thing that
-// breaks the build — surfacing the drift before any web4 wiring.
+// breaks the build — surfacing the drift early.
 var _ coreapi.Service = (*Adapter)(nil)
