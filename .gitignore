@@ -1,0 +1,13 @@
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+cap-state.jsonl
+identity.json
+identity-evm.json
+supervisor.log
+supervisor.log.1
+.suspended
+.resume
+.pilotctl-audit.log
+*.test
+*.out
