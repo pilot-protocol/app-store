@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -241,10 +242,31 @@ func (s *supervisor) scanInstalled() ([]*installedApp, error) {
 			s.logger.Printf("skip %s: invalid manifest: %v", e.Name(), errs[0])
 			continue
 		}
+		// Reject path traversal in manifest.binary.path. Without this
+		// a manifest containing binary.path="../../../bin/sh" (or any
+		// "..") would resolve OUTSIDE the app's install dir, letting
+		// a hostile or compromised manifest exec arbitrary host
+		// binaries under the daemon's uid.
+		binaryPath, err := resolveUnder(dir, m.Binary.Path)
+		if err != nil {
+			s.logger.Printf("skip %s: binary path %q escapes app dir: %v", e.Name(), m.Binary.Path, err)
+			continue
+		}
+		// Reject symlinks on the resolved binary. An attacker with
+		// write access to the app dir can drop a symlink that points
+		// to /bin/sh, /usr/bin/curl, or any other host binary. Lstat
+		// (not Stat) so we see the symlink itself, not its target.
+		// Non-existent paths are fine here — spawn() will produce the
+		// right error when it tries to exec. We only refuse a path
+		// that EXISTS AS A SYMLINK.
+		if fi, err := os.Lstat(binaryPath); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+			s.logger.Printf("skip %s: binary path %s is a symlink (refusing)", e.Name(), binaryPath)
+			continue
+		}
 		out = append(out, &installedApp{
 			Manifest:   m,
 			Dir:        dir,
-			BinaryPath: filepath.Join(dir, m.Binary.Path),
+			BinaryPath: binaryPath,
 			SocketPath: filepath.Join(dir, "app.sock"),
 			DBPath:     filepath.Join(dir, "data.db"),
 			IDPath:     filepath.Join(dir, "identity.json"),
@@ -759,4 +781,31 @@ func daemonAddrFromDeps(deps Deps) string {
 		}
 	}
 	return "0:0001.0000.0000"
+}
+
+// resolveUnder joins `rel` onto `base`, cleans it, and verifies the
+// result is contained inside `base`. Returns an error otherwise.
+//
+// Prevents the manifest path-traversal vector: filepath.Join itself
+// does not block `..` traversal; a manifest with binary.path =
+// "../../../bin/sh" would resolve outside the app's install dir and
+// let a hostile manifest exec arbitrary host binaries under the
+// daemon's UID.
+func resolveUnder(base, rel string) (string, error) {
+	if rel == "" {
+		return "", fmt.Errorf("empty path")
+	}
+	if filepath.IsAbs(rel) {
+		return "", fmt.Errorf("absolute path not permitted")
+	}
+	absBase, err := filepath.Abs(base)
+	if err != nil {
+		return "", fmt.Errorf("abs base: %w", err)
+	}
+	joined := filepath.Clean(filepath.Join(absBase, rel))
+	// Ensure joined is `absBase` itself OR `absBase + "/" + ...`.
+	if joined != absBase && !strings.HasPrefix(joined, absBase+string(filepath.Separator)) {
+		return "", fmt.Errorf("path escapes %s", absBase)
+	}
+	return joined, nil
 }
