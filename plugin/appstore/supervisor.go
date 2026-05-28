@@ -141,6 +141,13 @@ func newSupervisor(cfg Config, deps Deps, logger *log.Logger) *supervisor {
 const (
 	crashLoopWindow    = 60 * time.Second
 	maxCrashesInWindow = 5
+
+	// maxVerifyFails is the number of consecutive verifyBinary
+	// failures after which the supervisor stops retrying. A binary
+	// that fails sha256 every time is broken (corrupt, deleted,
+	// or tampered) and will never recover without an operator
+	// re-install — spinning forever is the worst option.
+	maxVerifyFails = 10
 )
 
 // crashRecord tracks recent process exits to detect crash-loops.
@@ -174,6 +181,20 @@ func (s *supervisor) recordCrash(appID string) bool {
 		rec.suspended = true
 	}
 	return rec.suspended
+}
+
+// markSuspended sets the app's suspended bit unconditionally.
+// Used when suspension is triggered outside the crash-loop path
+// (e.g. verify-fail cap).
+func (s *supervisor) markSuspended(appID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.crashes[appID]
+	if !ok {
+		rec = &crashRecord{}
+		s.crashes[appID] = rec
+	}
+	rec.suspended = true
 }
 
 // isSuspended reports whether the app's restart budget is spent.
@@ -489,24 +510,40 @@ func (s *supervisor) superviseOne(ctx context.Context, a *installedApp) {
 	defer func() {
 		reason := "context canceled"
 		if ctx.Err() == nil {
-			// Every non-ctx return path in this function is the
-			// crash-loop suspension; if a new return path is added
-			// without its own reason, this fallback still tells
-			// forensics the supervisor exited under its own steam.
-			reason = "suspended (crash-loop cap reached)"
+			// Every non-ctx return path in this function is a
+			// suspension (crash-loop or verify-fail cap); if a new
+			// return path is added without its own reason, this
+			// fallback still tells forensics the supervisor exited
+			// under its own steam.
+			reason = "suspended"
+			if s.isSuspended(a.Manifest.ID) {
+				reason = "suspended (verify-fail or crash-loop)"
+			}
 		}
 		s.writeAuditLine(a, auditEvent{Event: "supervise-stop", Reason: reason})
 	}()
 	backoff := time.Second
 	const maxBackoff = 30 * time.Second
+	verifyFails := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return
 		}
 		if err := s.verifyBinary(a); err != nil {
-			s.logger.Printf("app=%s: verify: %v — refusing to spawn", a.Manifest.ID, err)
+			verifyFails++
+			s.logger.Printf("app=%s: verify: %v — refusing to spawn (fail %d/%d)", a.Manifest.ID, err, verifyFails, maxVerifyFails)
 			s.writeAuditLine(a, auditEvent{Event: "verify-fail", Reason: err.Error(), SHA256: a.Manifest.Binary.SHA256, BinaryAt: a.BinaryPath})
-			// A bad sha256 is fatal for this app; wait + retry in case
+			if verifyFails >= maxVerifyFails {
+				s.logger.Printf("app=%s: verify-fail cap reached (%d) — SUSPENDED; not respawning until daemon restart or re-install", a.Manifest.ID, maxVerifyFails)
+				s.writeAuditLine(a, auditEvent{Event: "suspend", Reason: fmt.Sprintf(">=%d consecutive verify failures", maxVerifyFails)})
+				markerPath := filepath.Join(a.Dir, suspendedMarkerName)
+				if err := os.WriteFile(markerPath, nil, 0o600); err != nil {
+					s.logger.Printf("app=%s: write suspended marker: %v", a.Manifest.ID, err)
+				}
+				s.markSuspended(a.Manifest.ID)
+				return
+			}
+			// A bad sha256 may be transient; wait + retry in case
 			// the user fixes it (e.g. re-install).
 			select {
 			case <-ctx.Done():
@@ -515,6 +552,8 @@ func (s *supervisor) superviseOne(ctx context.Context, a *installedApp) {
 				continue
 			}
 		}
+		// verify passed — reset the consecutive-fail counter.
+		verifyFails = 0
 		exitCode := s.spawn(ctx, a)
 		s.markNotReady(a.Manifest.ID)
 		s.writeAuditLine(a, auditEvent{Event: "exit", ExitCode: exitCode})
