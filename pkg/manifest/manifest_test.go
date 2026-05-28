@@ -1,6 +1,11 @@
 package manifest
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -314,6 +319,75 @@ func mustValid(t *testing.T) *Manifest {
 		t.Fatalf("parse: %v", err)
 	}
 	return m
+}
+
+func base64Enc(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
+
+func signTestManifest(m *Manifest, priv ed25519.PrivateKey) (string, error) {
+	pub := priv.Public().(ed25519.PublicKey)
+	// Signing payload: publisher || id || manifest_version || binary.sha256 || grants-hash
+	grantsJSON, err := canonicalJSON(m.Grants)
+	if err != nil {
+		return "", err
+	}
+	grantsHash := sha256.Sum256(grantsJSON)
+	payload := fmt.Sprintf("ed25519:%s:%s:%d:%s:%x",
+		base64Enc(pub), m.ID, m.ManifestVersion, m.Binary.SHA256, grantsHash)
+	sig := ed25519.Sign(priv, []byte(payload))
+	return base64Enc(sig), nil
+}
+
+func TestVerifySignatureRejectsModifiedManifest(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := mustValid(t)
+	m.Store.Publisher = "ed25519:" + base64Enc(pub)
+	sig, err := signTestManifest(m, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Store.Signature = sig
+
+	if err := m.VerifySignature(); err != nil {
+		t.Errorf("valid signature rejected: %v", err)
+	}
+
+	m.Grants[0].Cap = "fs.delete"
+	if err := m.VerifySignature(); err == nil {
+		t.Error("expected error after tampering grants, got nil")
+	}
+}
+
+func TestVerifySignatureRejectsWrongKey(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := mustValid(t)
+	m.Store.Publisher = "ed25519:" + base64Enc(pub)
+	sig, err := signTestManifest(m, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Store.Publisher = "ed25519:" + base64Enc(otherPub)
+	m.Store.Signature = sig
+	if err := m.VerifySignature(); err == nil {
+		t.Error("expected error with mismatched publisher key, got nil")
+	}
+}
+
+func TestVerifySignatureRejectsEmptySignature(t *testing.T) {
+	m := mustValid(t)
+	m.Store.Signature = ""
+	if err := m.VerifySignature(); err == nil {
+		t.Error("expected error with empty signature, got nil")
+	}
 }
 
 func hasErrorContaining(errs []error, substr string) bool {

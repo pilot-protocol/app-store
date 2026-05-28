@@ -8,7 +8,14 @@
 // description; this file is the Go embodiment of that node.
 package manifest
 
-import "encoding/json"
+import (
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"strings"
+)
 
 // Manifest is the signed declaration of what an app is and what it's allowed
 // to do.
@@ -160,4 +167,72 @@ func (m *Manifest) Marshal() ([]byte, error) {
 	// output across implementations, we additionally sort map keys via the
 	// standard library's behavior (it already sorts map[string]interface{}).
 	return json.Marshal(m)
+}
+
+// canonicalJSON returns deterministic JSON bytes for v (sorted keys).
+func canonicalJSON(v any) ([]byte, error) {
+	return json.Marshal(v)
+}
+
+// signingPayload builds the canonical byte-string the Store.Signature
+// must sign. The publisher key is included so that a signature cannot
+// be reused with a different publisher identity — swapping the
+// publisher key invalidates the signature. Once a trust-anchor check
+// (hardcoded publisher pubkey match) is added, this guarantees the
+// manifest was signed by the known publisher.
+//
+// Format: publisher || ":" || id || ":" || manifest_version || ":" || binary.sha256 || ":" || grants-sha256-hex
+func (m *Manifest) signingPayload() ([]byte, error) {
+	grantsJSON, err := canonicalJSON(m.Grants)
+	if err != nil {
+		return nil, fmt.Errorf("grants marshal: %w", err)
+	}
+	grantsHash := sha256.Sum256(grantsJSON)
+	payload := fmt.Sprintf("%s:%s:%d:%s:%x",
+		m.Store.Publisher, m.ID, m.ManifestVersion, m.Binary.SHA256, grantsHash)
+	return []byte(payload), nil
+}
+
+// VerifySignature checks that Store.Signature is a valid ed25519
+// signature over the signing payload, verified against the Store.Publisher
+// key embedded in the manifest. This provides cryptographic integrity —
+// tampering with any manifest field that feeds the signing payload
+// (Publisher, ID, ManifestVersion, Binary.SHA256, Grants) will cause
+// verification to fail.
+//
+// NOTE: This does NOT check that Store.Publisher is a trusted key;
+// a trust-anchor check (verifying Store.Publisher against a
+// daemon-embedded trusted-publisher pubkey) is the next hardening step.
+func (m *Manifest) VerifySignature() error {
+	pubkeyRaw, ok := strings.CutPrefix(m.Store.Publisher, "ed25519:")
+	if !ok {
+		return fmt.Errorf("store.publisher must be \"ed25519:<base64>\"")
+	}
+	pubkey, err := base64.StdEncoding.DecodeString(pubkeyRaw)
+	if err != nil {
+		return fmt.Errorf("store.publisher: invalid base64: %w", err)
+	}
+	if len(pubkey) != ed25519.PublicKeySize {
+		return fmt.Errorf("store.publisher: wrong key length %d, want %d", len(pubkey), ed25519.PublicKeySize)
+	}
+
+	sigRaw := m.Store.Signature
+	// Accept optional "ed25519:" prefix on the signature too, for symmetry.
+	sigRaw = strings.TrimPrefix(sigRaw, "ed25519:")
+	sig, err := base64.StdEncoding.DecodeString(sigRaw)
+	if err != nil {
+		return fmt.Errorf("store.signature: invalid base64: %w", err)
+	}
+	if len(sig) != ed25519.SignatureSize {
+		return fmt.Errorf("store.signature: wrong signature length %d, want %d", len(sig), ed25519.SignatureSize)
+	}
+
+	payload, err := m.signingPayload()
+	if err != nil {
+		return err
+	}
+	if !ed25519.Verify(pubkey, payload, sig) {
+		return fmt.Errorf("store.signature: verification failed — manifest may have been tampered with")
+	}
+	return nil
 }

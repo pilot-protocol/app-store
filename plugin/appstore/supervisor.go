@@ -262,6 +262,12 @@ func (s *supervisor) scanInstalled() ([]*installedApp, error) {
 			s.logger.Printf("skip %s: invalid manifest: %v", e.Name(), errs[0])
 			continue
 		}
+		// Verify the store signature — rejects manifests whose
+		// Store.Signature doesn't verify against Store.Publisher.
+		if err := m.VerifySignature(); err != nil {
+			s.logger.Printf("skip %s: signature verification failed: %v", e.Name(), err)
+			continue
+		}
 		// Reject path traversal in manifest.binary.path. Without this
 		// a manifest containing binary.path="../../../bin/sh" (or any
 		// "..") would resolve OUTSIDE the app's install dir, letting
