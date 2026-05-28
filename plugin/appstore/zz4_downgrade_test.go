@@ -1,11 +1,18 @@
 package appstore
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/pilot-protocol/app-store/pkg/manifest"
 )
 
 // TestCompareVersions exercises the semver comparison helper.
@@ -135,7 +142,9 @@ func TestRegisterSameVersionIsIdempotent(t *testing.T) {
 }
 
 // writeAppDirWithVersion creates a valid app dir with a manifest
-// carrying the given version, and a stub binary.
+// carrying the given version, and a stub binary. The manifest is
+// signed with a fresh ed25519 keypair so scanInstalled's signature
+// verification (PILOT-98) accepts it.
 func writeAppDirWithVersion(t *testing.T, root, id, version string) string {
 	t.Helper()
 	dir := filepath.Join(root, id)
@@ -149,11 +158,33 @@ func writeAppDirWithVersion(t *testing.T, root, id, version string) string {
 	if err := os.WriteFile(filepath.Join(binDir, "x"), []byte("#!/bin/sh\necho ok"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	raw := fmt.Sprintf(
-		`{"id":%q,"app_version":%q,"manifest_version":1,"binary":{"runtime":"go","path":"bin/x","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"grants":[{"cap":"net.dial","target":"*"}],"store":{"publisher":"ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","signature":"sig"}}`,
-		id, version,
+
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	pubB64 := base64.StdEncoding.EncodeToString(pub)
+
+	template := fmt.Sprintf(
+		`{"id":%q,"app_version":%q,"manifest_version":1,"binary":{"runtime":"go","path":"bin/x","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"grants":[{"cap":"net.dial","target":"*"}],"store":{"publisher":"ed25519:%s","signature":""}}`,
+		id, version, pubB64,
 	)
-	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(raw), 0o644); err != nil {
+	m, err := manifest.Parse([]byte(template))
+	if err != nil {
+		t.Fatalf("parse template: %v", err)
+	}
+	grantsJSON, _ := json.Marshal(m.Grants)
+	grantsHash := sha256.Sum256(grantsJSON)
+	payload := fmt.Sprintf("%s:%s:%d:%s:%x",
+		m.Store.Publisher, m.ID, m.ManifestVersion, m.Binary.SHA256, grantsHash)
+	sig := ed25519.Sign(priv, []byte(payload))
+	m.Store.Signature = base64.StdEncoding.EncodeToString(sig)
+
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal signed manifest: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), raw, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return dir
@@ -229,6 +260,46 @@ func TestRescanAllowsUpgradeMidRun(t *testing.T) {
 	sup.mu.RUnlock()
 	if v != "2.0.0" {
 		t.Errorf("upgrade not applied: got %s, want 2.0.0", v)
+	}
+}
+
+// TestRescanAuditLogsUpgradeApplied confirms the supervisor writes an
+// "upgrade-applied" audit event when an in-place version swap lands
+// (symmetric counterpart to "downgrade-refused").
+func TestRescanAuditLogsUpgradeApplied(t *testing.T) {
+	root := t.TempDir()
+	appDir := writeAppDirWithVersion(t, root, "io.test.app", "1.0.0")
+
+	sup := newSupervisor(Config{
+		InstallRoot:    root,
+		RescanInterval: 20 * 1e6,
+	}, Deps{}, newQuietLogger(t))
+
+	entry := &installedApp{
+		Dir:        appDir,
+		Manifest:   parseDummyManifest(t, "io.test.app"),
+		BinaryPath: filepath.Join(appDir, "bin/x"),
+	}
+	entry.Manifest.AppVersion = "1.0.0"
+	sup.mu.Lock()
+	sup.installed["io.test.app"] = entry
+	sup.mu.Unlock()
+
+	writeAppDirWithVersion(t, root, "io.test.app", "2.0.0")
+	if fresh := sup.rescanForNew(); len(fresh) != 1 {
+		t.Fatalf("upgrade should be accepted, got fresh=%d", len(fresh))
+	}
+
+	data, err := os.ReadFile(filepath.Join(appDir, supervisorLogName))
+	if err != nil {
+		t.Fatalf("read audit log: %v", err)
+	}
+	body := string(data)
+	if !strings.Contains(body, "upgrade-applied") {
+		t.Errorf("audit log missing upgrade-applied event:\n%s", body)
+	}
+	if !strings.Contains(body, "1.0.0") || !strings.Contains(body, "2.0.0") {
+		t.Errorf("audit log missing version transition 1.0.0 → 2.0.0:\n%s", body)
 	}
 }
 

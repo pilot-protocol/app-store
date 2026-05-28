@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/coreapi"
+	"github.com/pilot-protocol/common/coreapi"
 	"github.com/pilot-protocol/app-store/pkg/ipc"
 	"github.com/pilot-protocol/app-store/plugin/appstore"
 )
@@ -21,7 +21,7 @@ import (
 // walletSourceDir is the path to the wallet module relative to the dev
 // layout. If absent (e.g. CI running on a checkout without sibling apps),
 // spawn-tests t.Skip rather than fail.
-const walletSourceDir = "/Users/calinteodor/Development/web4-apps/wallet"
+const walletSourceDir = "/Users/calinteodor/Development/pilot-protocol/wallet"
 
 // TestSupervisorSpawnsAndServesWallet builds the wallet binary, pins it
 // into a fake install root with a real manifest, starts the supervisor
