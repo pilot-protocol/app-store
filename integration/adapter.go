@@ -1,6 +1,6 @@
 // Package integration is the glue layer between the app-store shim and
 // the pilot daemon. It imports both modules and provides an Adapter that
-// satisfies github.com/TeoSlayer/pilotprotocol/pkg/coreapi.Service by
+// satisfies github.com/pilot-protocol/common/coreapi.Service by
 // forwarding to *appstore.Service.
 //
 // This package is intentionally *not* part of the main app-store module's
@@ -13,7 +13,7 @@ package integration
 import (
 	"context"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/coreapi"
+	"github.com/pilot-protocol/common/coreapi"
 	"github.com/pilot-protocol/app-store/plugin/appstore"
 )
 

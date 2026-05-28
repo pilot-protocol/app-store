@@ -434,6 +434,12 @@ func (s *supervisor) rescanForNew() []*installedApp {
 			delete(s.ready, a.Manifest.ID)
 			s.logger.Printf("rescan: version upgrade detected: app=%s %s → %s — restarting",
 				a.Manifest.ID, existing.Manifest.AppVersion, a.Manifest.AppVersion)
+			s.writeAuditLine(a, auditEvent{
+				Event:    "upgrade-applied",
+				Reason:   fmt.Sprintf("rescan: %s → %s", existing.Manifest.AppVersion, a.Manifest.AppVersion),
+				SHA256:   a.Manifest.Binary.SHA256,
+				BinaryAt: a.BinaryPath,
+			})
 		}
 		s.installed[a.Manifest.ID] = a
 		fresh = append(fresh, a)
