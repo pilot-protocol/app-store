@@ -62,11 +62,9 @@ func (s *supervisor) writeAuditLine(a *installedApp, ev auditEvent) {
 	if ev.At.IsZero() {
 		ev.At = time.Now().UTC()
 	}
-	body, err := json.Marshal(&ev)
-	if err != nil {
-		s.logger.Printf("audit marshal: %v", err)
-		return
-	}
+	// auditEvent is all primitives (time.Time + strings + ints); json.Marshal
+	// cannot fail on it, so we ignore the error to avoid an unreachable branch.
+	body, _ := json.Marshal(&ev)
 	body = append(body, '\n')
 	path := filepath.Join(a.Dir, supervisorLogName)
 	s.rotateAuditIfLarge(a.Dir)
