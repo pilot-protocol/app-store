@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -277,10 +278,24 @@ func (s *supervisor) scanInstalled() ([]*installedApp, error) {
 // in-memory table. Called by Service.Start *before* the supervise
 // goroutine kicks off, so callers of Apps() / Call() see the right
 // set the moment Start returns (no race against run()'s startup).
+//
+// Refuses to register an app if the manifest's app_version is a
+// downgrade from an already-registered entry for the same app ID.
+// This guards against re-installs that would silently roll back
+// a security patch (see downgrade protection, PILOT-105).
 func (s *supervisor) registerInstalled(apps []*installedApp) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, a := range apps {
+		if existing, ok := s.installed[a.Manifest.ID]; ok {
+			if compareVersions(a.Manifest.AppVersion, existing.Manifest.AppVersion) < 0 {
+				s.logger.Printf("downgrade refused: app=%s new=%s old=%s — keeping existing version",
+					a.Manifest.ID, a.Manifest.AppVersion, existing.Manifest.AppVersion)
+				s.writeAuditLine(a, auditEvent{Event: "downgrade-refused",
+					Reason: fmt.Sprintf("refusing %s (existing %s)", a.Manifest.AppVersion, existing.Manifest.AppVersion)})
+				continue
+			}
+		}
 		s.installed[a.Manifest.ID] = a
 	}
 }
@@ -355,6 +370,11 @@ func (s *supervisor) run(ctx context.Context, apps []*installedApp) {
 // concurrent Apps()/Call() reads see them as soon as a supervise
 // goroutine starts. Errors are logged and treated as "no new apps";
 // a transient FS issue shouldn't kill the supervisor.
+//
+// For apps already in the in-memory map, detects on-disk manifest
+// changes (e.g. a re-install by pilotctl while the daemon runs) and
+// refuses to accept a version downgrade. Same-app different-version
+// upgrades are accepted; the new supervise goroutine replaces the old.
 func (s *supervisor) rescanForNew() []*installedApp {
 	apps, err := s.scanInstalled()
 	if err != nil {
@@ -365,8 +385,28 @@ func (s *supervisor) rescanForNew() []*installedApp {
 	defer s.mu.Unlock()
 	var fresh []*installedApp
 	for _, a := range apps {
-		if _, exists := s.installed[a.Manifest.ID]; exists {
-			continue
+		if existing, ok := s.installed[a.Manifest.ID]; ok {
+			if existing.Manifest.AppVersion == a.Manifest.AppVersion {
+				continue // same version, nothing to do
+			}
+			if compareVersions(a.Manifest.AppVersion, existing.Manifest.AppVersion) < 0 {
+				s.logger.Printf("rescan: downgrade refused: app=%s new=%s old=%s — keeping existing version",
+					a.Manifest.ID, a.Manifest.AppVersion, existing.Manifest.AppVersion)
+				s.writeAuditLine(a, auditEvent{Event: "downgrade-refused",
+					Reason: fmt.Sprintf("rescan: refusing %s (existing %s)", a.Manifest.AppVersion, existing.Manifest.AppVersion)})
+				continue
+			}
+			// Version upgrade detected on disk: cancel the old supervise
+			// goroutine and register the new manifest. The old app
+			// will be torn down by its ctx cancel; the rescan loop
+			// (run()) will spawn a fresh goroutine for this entry.
+			if cancel, cancelOk := s.appCancel[a.Manifest.ID]; cancelOk {
+				cancel()
+				delete(s.appCancel, a.Manifest.ID)
+			}
+			delete(s.ready, a.Manifest.ID)
+			s.logger.Printf("rescan: version upgrade detected: app=%s %s → %s — restarting",
+				a.Manifest.ID, existing.Manifest.AppVersion, a.Manifest.AppVersion)
 		}
 		s.installed[a.Manifest.ID] = a
 		fresh = append(fresh, a)
@@ -467,6 +507,77 @@ func (s *supervisor) rescanForResume() []*installedApp {
 		resumed = append(resumed, a)
 	}
 	return resumed
+}
+
+// compareVersions compares two semver strings (MAJOR.MINOR.PATCH[-PRERELEASE]).
+// Returns -1 if a < b, 0 if equal, 1 if a > b.
+// Both must be valid per semverPattern; behaviour on invalid input is undefined.
+func compareVersions(a, b string) int {
+	if a == b {
+		return 0
+	}
+	// Strip prerelease suffix for numeric comparison.
+	aNum, aPre := splitSemver(a)
+	bNum, bPre := splitSemver(b)
+	if c := compareNumericParts(aNum, bNum); c != 0 {
+		return c
+	}
+	// Same numeric parts: no prerelease > prerelease.
+	if aPre == "" && bPre != "" {
+		return 1
+	}
+	if aPre != "" && bPre == "" {
+		return -1
+	}
+	// Both have prerelease: lexical tiebreak.
+	if aPre < bPre {
+		return -1
+	}
+	if aPre > bPre {
+		return 1
+	}
+	return 0
+}
+
+// splitSemver splits "1.2.3-alpha" into ("1.2.3", "alpha").
+func splitSemver(v string) (numeric, prerelease string) {
+	idx := strings.IndexByte(v, '-')
+	if idx < 0 {
+		return v, ""
+	}
+	return v[:idx], v[idx+1:]
+}
+
+// compareNumericParts compares "MAJOR.MINOR.PATCH" dotted triples numerically.
+func compareNumericParts(a, b string) int {
+	aParts := strings.Split(a, ".")
+	bParts := strings.Split(b, ".")
+	for i := 0; i < 3; i++ {
+		av := atoiOrZero(indexOrEmpty(aParts, i))
+		bv := atoiOrZero(indexOrEmpty(bParts, i))
+		if av < bv {
+			return -1
+		}
+		if av > bv {
+			return 1
+		}
+	}
+	return 0
+}
+
+func indexOrEmpty(parts []string, i int) string {
+	if i < len(parts) {
+		return parts[i]
+	}
+	return "0"
+}
+
+func atoiOrZero(s string) int {
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // superviseOne runs one app forever, respawning on exit until ctx is canceled.
