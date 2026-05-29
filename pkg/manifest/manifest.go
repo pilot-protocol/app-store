@@ -9,6 +9,7 @@
 package manifest
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
@@ -193,6 +194,51 @@ func (m *Manifest) signingPayload() ([]byte, error) {
 	return []byte(payload), nil
 }
 
+// TrustedPublishers is the compile-time-embedded list of publisher
+// ed25519 public keys ("ed25519:<base64>" or raw base64) that are
+// trusted to sign manifests. Empty list = fail-closed (no publisher
+// passes the trust-anchor check). Production builds MUST populate
+// this list with the known-good publisher keys.
+var TrustedPublishers []string
+
+// VerifyTrustAnchor checks that Store.Publisher is on the trusted
+// publishers list. Without this check, VerifySignature only confirms
+// the manifest was signed by whoever claims to be the publisher;
+// VerifyTrustAnchor confirms the publisher itself is known and trusted.
+//
+// Returns nil if Store.Publisher is in TrustedPublishers.
+// Returns an error if TrustedPublishers is empty (fail-closed) or if
+// the publisher is not found.
+func (m *Manifest) VerifyTrustAnchor() error {
+	if len(TrustedPublishers) == 0 {
+		return fmt.Errorf("trust anchor: TrustedPublishers is empty — no publisher is trusted")
+	}
+
+	pubkeyRaw, ok := strings.CutPrefix(m.Store.Publisher, "ed25519:")
+	if !ok {
+		return fmt.Errorf("store.publisher must be \"ed25519:<base64>\"")
+	}
+	pubkey, err := base64.StdEncoding.DecodeString(pubkeyRaw)
+	if err != nil {
+		return fmt.Errorf("store.publisher: invalid base64: %w", err)
+	}
+	if len(pubkey) != ed25519.PublicKeySize {
+		return fmt.Errorf("store.publisher: wrong key length %d, want %d", len(pubkey), ed25519.PublicKeySize)
+	}
+
+	for _, trusted := range TrustedPublishers {
+		trustedRaw := strings.TrimPrefix(trusted, "ed25519:")
+		trustedKey, err := base64.StdEncoding.DecodeString(trustedRaw)
+		if err != nil {
+			continue // skip malformed entries
+		}
+		if bytes.Equal(pubkey, trustedKey) {
+			return nil
+		}
+	}
+	return fmt.Errorf("trust anchor: publisher %s is not on the trusted-publishers list", m.Store.Publisher)
+}
+
 // VerifySignature checks that Store.Signature is a valid ed25519
 // signature over the signing payload, verified against the Store.Publisher
 // key embedded in the manifest. This provides cryptographic integrity —
@@ -200,9 +246,9 @@ func (m *Manifest) signingPayload() ([]byte, error) {
 // (Publisher, ID, ManifestVersion, Binary.SHA256, Grants) will cause
 // verification to fail.
 //
-// NOTE: This does NOT check that Store.Publisher is a trusted key;
-// a trust-anchor check (verifying Store.Publisher against a
-// daemon-embedded trusted-publisher pubkey) is the next hardening step.
+// IMPORTANT: This does NOT check that Store.Publisher is a trusted key.
+// Callers MUST also call VerifyTrustAnchor() after VerifySignature()
+// to confirm the publisher is on the TrustedPublishers list.
 func (m *Manifest) VerifySignature() error {
 	pubkeyRaw, ok := strings.CutPrefix(m.Store.Publisher, "ed25519:")
 	if !ok {
