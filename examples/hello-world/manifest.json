@@ -1,0 +1,32 @@
+{
+  "id": "io.example.hello",
+  "app_version": "0.1.0",
+  "manifest_version": 1,
+  "binary": {
+    "runtime": "go",
+    "path": "bin/hello",
+    "sha256": "REPLACE_WITH_BUILD_OUTPUT"
+  },
+  "exposes": [
+    "hello.echo"
+  ],
+  "grants": [
+    {
+      "cap": "audit.log",
+      "target": "*"
+    },
+    {
+      "cap": "fs.write",
+      "target": "$APP/data.db"
+    },
+    {
+      "cap": "fs.read",
+      "target": "$APP/data.db"
+    }
+  ],
+  "protection": "shareable",
+  "store": {
+    "publisher": "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    "signature": "sig:placeholder-replaced-by-pilotctl-appstore-sign"
+  }
+}
