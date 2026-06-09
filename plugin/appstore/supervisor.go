@@ -227,6 +227,14 @@ type installedApp struct {
 	SocketPath string // Dir/app.sock
 	DBPath     string // Dir/data.db
 	IDPath     string // Dir/identity.json
+
+	// Sideloaded is true when the app's install dir contains a
+	// `.sideloaded` marker file. Sideloaded apps skip the
+	// publisher-signature check but are forced through
+	// manifest.EnforceSideloadPolicy at scan time, and the child
+	// process gets PILOT_SIDELOAD=1 in its environment so the app
+	// itself can take additional precautions if it chooses to.
+	Sideloaded bool
 }
 
 // scanInstalled walks InstallRoot, reads each `<app>/manifest.json`, and
@@ -262,11 +270,26 @@ func (s *supervisor) scanInstalled() ([]*installedApp, error) {
 			s.logger.Printf("skip %s: invalid manifest: %v", e.Name(), errs[0])
 			continue
 		}
-		// Verify the store signature — rejects manifests whose
-		// Store.Signature doesn't verify against Store.Publisher.
-		if err := m.VerifySignature(); err != nil {
-			s.logger.Printf("skip %s: signature verification failed: %v", e.Name(), err)
-			continue
+		// Sideload detection: presence of `.sideloaded` in the install
+		// dir flips the trust regime. Sideloaded apps skip the
+		// publisher-signature check (they were never signed by the
+		// catalogue) but must satisfy the sideload allow-list — any
+		// grant or extension outside the safe subset is refused here,
+		// not silently accepted.
+		_, sideErr := os.Stat(filepath.Join(dir, manifest.SideloadMarkerName))
+		sideloaded := sideErr == nil
+		if sideloaded {
+			if err := manifest.EnforceSideloadPolicy(m); err != nil {
+				s.logger.Printf("skip %s: sideload policy violation: %v", e.Name(), err)
+				continue
+			}
+		} else {
+			// Catalogue path: signature must verify against the
+			// publisher key embedded in the manifest.
+			if err := m.VerifySignature(); err != nil {
+				s.logger.Printf("skip %s: signature verification failed: %v", e.Name(), err)
+				continue
+			}
 		}
 		// Reject path traversal in manifest.binary.path. Without this
 		// a manifest containing binary.path="../../../bin/sh" (or any
@@ -296,6 +319,7 @@ func (s *supervisor) scanInstalled() ([]*installedApp, error) {
 			SocketPath: filepath.Join(dir, "app.sock"),
 			DBPath:     filepath.Join(dir, "data.db"),
 			IDPath:     filepath.Join(dir, "identity.json"),
+			Sideloaded: sideloaded,
 		})
 	}
 	return out, nil
@@ -761,7 +785,15 @@ func (s *supervisor) spawn(ctx context.Context, a *installedApp) int {
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // own process group → clean SIGTERM
-	s.logger.Printf("app=%s spawn binary=%s socket=%s", a.Manifest.ID, a.BinaryPath, a.SocketPath)
+	if a.Sideloaded {
+		// Signal sideload status to cap-aware children. Apps that
+		// honour their declared grants (e.g. the wallet) can read
+		// PILOT_SIDELOAD and refuse to construct objects that aren't
+		// in the sideload allow-list — defence in depth on top of the
+		// manifest gate.
+		cmd.Env = append(os.Environ(), "PILOT_SIDELOAD=1")
+	}
+	s.logger.Printf("app=%s spawn binary=%s socket=%s sideloaded=%v", a.Manifest.ID, a.BinaryPath, a.SocketPath, a.Sideloaded)
 
 	if err := cmd.Start(); err != nil {
 		s.logger.Printf("app=%s start: %v", a.Manifest.ID, err)
