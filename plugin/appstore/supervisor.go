@@ -826,12 +826,44 @@ func (s *supervisor) verifyBinary(a *installedApp) error {
 	return nil
 }
 
+// verifyAtSpawn re-runs the binary trust checks immediately before exec,
+// closing the TOCTOU window between scanInstalled (which checks once, at
+// discovery) and the actual launch. An attacker who swaps the resolved
+// binary for a symlink (→ a host binary like /bin/sh) or for different
+// bytes after the scan but before spawn is caught here, not after the
+// hostile code has already run.
+//
+// Lstat (not Stat) so a symlink is seen as itself, not followed. The
+// sha256 re-hash reuses verifyBinary. A tiny residual window remains
+// between this check and execve — inherent to any check-then-exec — but
+// it is orders of magnitude smaller than scan-to-spawn.
+func (s *supervisor) verifyAtSpawn(a *installedApp) error {
+	fi, err := os.Lstat(a.BinaryPath)
+	if err != nil {
+		return fmt.Errorf("lstat binary: %w", err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("binary path %s is a symlink (refusing)", a.BinaryPath)
+	}
+	return s.verifyBinary(a)
+}
+
 // spawn launches the app's binary, blocks until it exits, returns the
 // exit code (or -1 on error). The caller is responsible for restart logic.
 //
 // Marks the app "ready" once its socket has appeared, so concurrent
 // Call() invocations can know when to dial.
 func (s *supervisor) spawn(ctx context.Context, a *installedApp) int {
+	// TOCTOU guard: re-verify the binary (no symlink, sha256 still
+	// matches) immediately before exec. The supervise loop already
+	// verified at the top of its cycle, but a swap could land in the
+	// window between that check and this exec — refuse to launch if so.
+	if err := s.verifyAtSpawn(a); err != nil {
+		s.logger.Printf("app=%s: spawn-time verify failed: %v — refusing to exec", a.Manifest.ID, err)
+		s.writeAuditLine(a, auditEvent{Event: "verify-fail", Reason: "spawn-time: " + err.Error(), SHA256: a.Manifest.Binary.SHA256, BinaryAt: a.BinaryPath})
+		return -1
+	}
+
 	// Drop a stale socket if a previous instance crashed without cleaning.
 	if _, err := os.Stat(a.SocketPath); err == nil {
 		_ = os.Remove(a.SocketPath)
