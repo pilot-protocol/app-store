@@ -13,6 +13,29 @@ First release candidate. Surface is end-to-end working for the
 Production deployment against an untrusted publisher requires the
 catalog-signing chain landed in a follow-up RC (see "Known gaps").
 
+### Security & hardening — broker + supervisor
+
+- **Broker authorization (deny-by-default).** Every brokered call is
+  gated before dialing an app socket: the method must be in the target's
+  `exposes` set, and cross-app `ipc.call` callers must hold a matching
+  grant (`<app>.<method>`, `<app>.*`, or `*`). New `Service.CallFrom` and
+  `manifest.ExposesMethod` / `HasGrant`; errors `ErrMethodNotExposed`,
+  `ErrGrantMissing`.
+- **TOCTOU re-verification at spawn.** The binary is re-checked
+  immediately before `exec` (symlink rejection + sha256), closing the gap
+  between install-scan and launch.
+- **Exponential verify-fail backoff.** Verification failures retry with
+  capped exponential backoff (was a fixed 30s), consistent with crash-loop
+  handling.
+- **Multi-generation audit log rotation.** `supervisor.log` rotates across
+  N generations (`AuditLogMaxBackups`, default 3) instead of a single step.
+- **Address-space cap (Linux).** Spawned apps get `RLIMIT_AS` alongside
+  `RLIMIT_NOFILE`, configurable via `Config.ChildMemoryLimitBytes`
+  (default 4 GiB); no-op on non-Linux.
+- **Extension DoS guards.** `pkg/extend` adds per-app hook-dispatch rate
+  limiting (`Registry.SetRateLimit`, `ErrRateLimited`) and a per-app cap on
+  dynamic registrations (`ErrTooManyRegistrations`).
+
 ### Added — pilotctl
 
 `pilotctl appstore` is the operator surface for the app store.

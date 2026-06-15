@@ -36,6 +36,18 @@ var DenyAll Permission = PermissionFunc(func(string, HookPoint) bool { return fa
 // configured Permission rejects the request.
 var ErrPermissionDenied = errors.New("extend: permission denied")
 
+// maxDynamicRegistrationsPerApp bounds how many hooks a single app may
+// hold at once via the runtime-register IPC. Without a cap, an app
+// permitted to register dynamically could register unboundedly and
+// exhaust memory / slow every primitive's hook lookup — a DoS. The
+// cap is generous (a well-behaved app registers a handful of hooks)
+// while refusing pathological growth.
+const maxDynamicRegistrationsPerApp = 32
+
+// ErrTooManyRegistrations is returned by DaemonHandler.Register when an
+// app already holds maxDynamicRegistrationsPerApp hooks.
+var ErrTooManyRegistrations = errors.New("extend: too many dynamic registrations for app")
+
 // DaemonHandler is the runtime-side IPC surface the daemon exposes to
 // installed apps so they can add/remove their own hooks dynamically
 // (within the bounds Permission allows). Apps call these methods via
@@ -67,6 +79,11 @@ func (h *DaemonHandler) Register(appID string, ext Extension) error {
 	}
 	if !h.perms.CanRegister(appID, ext.Primitive) {
 		return fmt.Errorf("%w: %s cannot register %s", ErrPermissionDenied, appID, ext.Primitive)
+	}
+	// Bound the number of hooks one app may hold to prevent unbounded
+	// dynamic registration (memory + per-primitive lookup-cost DoS).
+	if h.reg.CountForApp(appID) >= maxDynamicRegistrationsPerApp {
+		return fmt.Errorf("%w: %s holds %d (max %d)", ErrTooManyRegistrations, appID, h.reg.CountForApp(appID), maxDynamicRegistrationsPerApp)
 	}
 	return h.reg.Register(ext)
 }

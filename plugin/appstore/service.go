@@ -47,10 +47,24 @@ type Config struct {
 	RescanInterval time.Duration
 
 	// AuditLogMaxBytes is the per-app supervisor.log size threshold
-	// at which a single-step rotation fires (active → .1). Zero
-	// defaults to maxAuditLogSize (10MB). Tests set this low to
-	// exercise the rotation path without writing megabytes.
+	// at which rotation fires (active → .1). Zero defaults to
+	// maxAuditLogSize (10MB). Tests set this low to exercise the
+	// rotation path without writing megabytes.
 	AuditLogMaxBytes int64
+
+	// AuditLogMaxBackups is the number of rotated generations the
+	// supervisor keeps (supervisor.log.1 .. .N). Zero defaults to
+	// defaultAuditLogBackups (3). Worst-case per-app footprint is
+	// (AuditLogMaxBackups+1) × AuditLogMaxBytes.
+	AuditLogMaxBackups int
+
+	// ChildMemoryLimitBytes caps the virtual address space (RLIMIT_AS)
+	// of each spawned app process on Linux. Zero defaults to
+	// defaultChildAddressSpaceLimit (4 GiB). No-op on non-Linux
+	// platforms. Set generously — RLIMIT_AS bounds address space, not
+	// RSS, and runtime-managed languages reserve far more virtual
+	// memory than they use.
+	ChildMemoryLimitBytes uint64
 }
 
 // EmbeddedCatalogPubkey is the production trust anchor for the catalog.
@@ -233,4 +247,22 @@ func (s *Service) Call(ctx context.Context, appID, method string, args, out any)
 		return errors.New("appstore: service not started")
 	}
 	return sup.Call(ctx, appID, method, args, out)
+}
+
+// CallFrom is the cross-app broker entry point. callerID identifies the
+// installed app making the request; the supervisor authorizes the call
+// against that app's manifest grants (it must declare an `ipc.call` grant
+// targeting "<appID>.<method>"). Pass an empty callerID for trusted
+// daemon/pilotctl calls — see Call.
+//
+// Returns ErrAppNotInstalled, ErrMethodNotExposed, ErrGrantMissing, or
+// ErrAppNotReady for the gate failures; otherwise the app's IPC response.
+func (s *Service) CallFrom(ctx context.Context, callerID, appID, method string, args, out any) error {
+	s.startMu.Lock()
+	sup := s.sup
+	s.startMu.Unlock()
+	if sup == nil {
+		return errors.New("appstore: service not started")
+	}
+	return sup.CallFrom(ctx, callerID, appID, method, args, out)
 }

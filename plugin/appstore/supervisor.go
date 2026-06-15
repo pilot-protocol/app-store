@@ -28,12 +28,26 @@ import (
 // `pilotctl appstore audit <id>` can read it without daemon glue.
 const supervisorLogName = "supervisor.log"
 
-// supervisorLogRotated is the single-step rotation target. On reaching
-// maxAuditLogSize, writeAuditLine moves supervisor.log here (overwriting
-// any prior copy) and starts fresh. Single-step keeps the design simple:
-// worst-case footprint is 2 × maxAuditLogSize per app, plenty of history
-// for an incident, and no log.2/log.3 chain to manage.
+// supervisorLogRotated is the first rotated generation (supervisor.log.1).
+// On reaching the size threshold the active log shifts to .1, the prior
+// .1 shifts to .2, and so on up to the configured backup count; the
+// oldest generation beyond that is discarded. Worst-case footprint is
+// (backups+1) × maxAuditLogSize per app.
 const supervisorLogRotated = "supervisor.log.1"
+
+// defaultAuditLogBackups is the number of rotated generations kept
+// (supervisor.log.1 .. .N) when Config.AuditLogMaxBackups is unset.
+// Three generations + the active log keeps a useful incident window
+// without unbounded disk growth.
+const defaultAuditLogBackups = 3
+
+// defaultChildAddressSpaceLimit is the RLIMIT_AS cap applied to spawned
+// app processes when Config.ChildMemoryLimitBytes is unset. 4 GiB is
+// generous enough for Go/Node/Python runtime virtual reservations (a
+// trivial Go binary needs ~1 GiB of address space) while still bounding
+// a runaway / hostile app well below host memory. Linux-only; see
+// rlimit_linux.go.
+const defaultChildAddressSpaceLimit uint64 = 4 << 30
 
 // maxAuditLogSize bounds each app's active audit log. A crash-looping
 // app emits ~5 lines per failed spawn cycle (verify-fail / exit /
@@ -80,10 +94,12 @@ func (s *supervisor) writeAuditLine(a *installedApp, ev auditEvent) {
 	}
 }
 
-// rotateAuditIfLarge renames supervisor.log → supervisor.log.1 when
-// the active log has crossed the configured size threshold. The
-// threshold defaults to maxAuditLogSize but can be lowered for tests
-// via supervisor.cfg.AuditLogMaxBytes. Errors are logged but never
+// rotateAuditIfLarge rotates the audit log when the active
+// supervisor.log has crossed the configured size threshold, keeping up
+// to N rotated generations (supervisor.log.1 .. .N). The threshold
+// defaults to maxAuditLogSize and the generation count to
+// defaultAuditLogBackups; both can be overridden via Config
+// (AuditLogMaxBytes / AuditLogMaxBackups). Errors are logged but never
 // fatal — forensics best-effort, never blocks the lifecycle write.
 func (s *supervisor) rotateAuditIfLarge(appDir string) {
 	max := int64(maxAuditLogSize)
@@ -98,12 +114,43 @@ func (s *supervisor) rotateAuditIfLarge(appDir string) {
 	if info.Size() < max {
 		return
 	}
-	rotated := filepath.Join(appDir, supervisorLogRotated)
-	// os.Rename replaces the destination atomically on Unix, so a
-	// concurrent reader of the rotated path will see either the old
-	// or the new one — never a partial file.
-	if err := os.Rename(active, rotated); err != nil {
-		s.logger.Printf("audit rotate %s → %s: %v", active, rotated, err)
+	keep := defaultAuditLogBackups
+	if s.cfg.AuditLogMaxBackups > 0 {
+		keep = s.cfg.AuditLogMaxBackups
+	}
+	s.rotateGenerations(appDir, keep)
+}
+
+// rotateGenerations shifts the audit log generations down by one,
+// keeping at most `keep` rotated copies: supervisor.log.(keep) is
+// discarded, .(keep-1)→.keep, …, .1→.2, and the active
+// supervisor.log→.1. Each os.Rename replaces its destination
+// atomically on Unix, so a concurrent reader of any generation sees a
+// whole file, never a partial one. Errors are logged, never fatal.
+func (s *supervisor) rotateGenerations(appDir string, keep int) {
+	if keep < 1 {
+		keep = 1
+	}
+	gen := func(i int) string {
+		if i == 0 {
+			return filepath.Join(appDir, supervisorLogName)
+		}
+		return filepath.Join(appDir, fmt.Sprintf("%s.%d", supervisorLogName, i))
+	}
+	// Discard the generation that would fall off the end.
+	if err := os.Remove(gen(keep)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		s.logger.Printf("audit rotate: remove %s: %v", gen(keep), err)
+	}
+	// Shift each surviving generation down one slot, oldest first so we
+	// never clobber a file we still need to move.
+	for i := keep - 1; i >= 0; i-- {
+		src, dst := gen(i), gen(i+1)
+		if _, err := os.Stat(src); errors.Is(err, os.ErrNotExist) {
+			continue // gap in the chain — nothing to move
+		}
+		if err := os.Rename(src, dst); err != nil {
+			s.logger.Printf("audit rotate %s → %s: %v", src, dst, err)
+		}
 	}
 }
 
@@ -637,6 +684,25 @@ func atoiOrZero(s string) int {
 	return n
 }
 
+// childAddressSpaceLimit resolves the RLIMIT_AS cap for spawned apps:
+// the configured value, or defaultChildAddressSpaceLimit when unset.
+func (s *supervisor) childAddressSpaceLimit() uint64 {
+	if s.cfg.ChildMemoryLimitBytes > 0 {
+		return s.cfg.ChildMemoryLimitBytes
+	}
+	return defaultChildAddressSpaceLimit
+}
+
+// nextBackoff doubles cur, capping at max. Shared by superviseOne's
+// crash-restart and verify-fail backoff ramps so both grow identically.
+func nextBackoff(cur, max time.Duration) time.Duration {
+	next := cur * 2
+	if next > max {
+		return max
+	}
+	return next
+}
+
 // superviseOne runs one app forever, respawning on exit until ctx is canceled.
 func (s *supervisor) superviseOne(ctx context.Context, a *installedApp) {
 	// Mark the start + end of supervision. The pair tells forensics
@@ -671,6 +737,11 @@ func (s *supervisor) superviseOne(ctx context.Context, a *installedApp) {
 	}()
 	backoff := time.Second
 	const maxBackoff = 30 * time.Second
+	// verifyBackoff grows independently of the crash-restart backoff so a
+	// binary that fails sha256 verification doesn't hammer the disk every
+	// 30s — it ramps 1s→2s→4s…→30s, consistent with crash-loop handling,
+	// and resets the moment a verification succeeds.
+	verifyBackoff := time.Second
 	verifyFails := 0
 	for {
 		if err := ctx.Err(); err != nil {
@@ -690,17 +761,20 @@ func (s *supervisor) superviseOne(ctx context.Context, a *installedApp) {
 				s.markSuspended(a.Manifest.ID)
 				return
 			}
-			// A bad sha256 may be transient; wait + retry in case
-			// the user fixes it (e.g. re-install).
+			// A bad sha256 may be transient; wait + retry with capped
+			// exponential backoff in case the user fixes it (re-install).
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(maxBackoff):
-				continue
+			case <-time.After(verifyBackoff):
 			}
+			verifyBackoff = nextBackoff(verifyBackoff, maxBackoff)
+			continue
 		}
-		// verify passed — reset the consecutive-fail counter.
+		// verify passed — reset the consecutive-fail counter and the
+		// verify backoff so a later transient failure starts fresh.
 		verifyFails = 0
+		verifyBackoff = time.Second
 		exitCode := s.spawn(ctx, a)
 		s.markNotReady(a.Manifest.ID)
 		s.writeAuditLine(a, auditEvent{Event: "exit", ExitCode: exitCode})
@@ -728,10 +802,7 @@ func (s *supervisor) superviseOne(ctx context.Context, a *installedApp) {
 			return
 		case <-time.After(backoff):
 		}
-		backoff *= 2
-		if backoff > maxBackoff {
-			backoff = maxBackoff
-		}
+		backoff = nextBackoff(backoff, maxBackoff)
 	}
 }
 
@@ -755,12 +826,44 @@ func (s *supervisor) verifyBinary(a *installedApp) error {
 	return nil
 }
 
+// verifyAtSpawn re-runs the binary trust checks immediately before exec,
+// closing the TOCTOU window between scanInstalled (which checks once, at
+// discovery) and the actual launch. An attacker who swaps the resolved
+// binary for a symlink (→ a host binary like /bin/sh) or for different
+// bytes after the scan but before spawn is caught here, not after the
+// hostile code has already run.
+//
+// Lstat (not Stat) so a symlink is seen as itself, not followed. The
+// sha256 re-hash reuses verifyBinary. A tiny residual window remains
+// between this check and execve — inherent to any check-then-exec — but
+// it is orders of magnitude smaller than scan-to-spawn.
+func (s *supervisor) verifyAtSpawn(a *installedApp) error {
+	fi, err := os.Lstat(a.BinaryPath)
+	if err != nil {
+		return fmt.Errorf("lstat binary: %w", err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("binary path %s is a symlink (refusing)", a.BinaryPath)
+	}
+	return s.verifyBinary(a)
+}
+
 // spawn launches the app's binary, blocks until it exits, returns the
 // exit code (or -1 on error). The caller is responsible for restart logic.
 //
 // Marks the app "ready" once its socket has appeared, so concurrent
 // Call() invocations can know when to dial.
 func (s *supervisor) spawn(ctx context.Context, a *installedApp) int {
+	// TOCTOU guard: re-verify the binary (no symlink, sha256 still
+	// matches) immediately before exec. The supervise loop already
+	// verified at the top of its cycle, but a swap could land in the
+	// window between that check and this exec — refuse to launch if so.
+	if err := s.verifyAtSpawn(a); err != nil {
+		s.logger.Printf("app=%s: spawn-time verify failed: %v — refusing to exec", a.Manifest.ID, err)
+		s.writeAuditLine(a, auditEvent{Event: "verify-fail", Reason: "spawn-time: " + err.Error(), SHA256: a.Manifest.Binary.SHA256, BinaryAt: a.BinaryPath})
+		return -1
+	}
+
 	// Drop a stale socket if a previous instance crashed without cleaning.
 	if _, err := os.Stat(a.SocketPath); err == nil {
 		_ = os.Remove(a.SocketPath)
@@ -805,7 +908,7 @@ func (s *supervisor) spawn(ctx context.Context, a *installedApp) int {
 	// child. Best-effort: a failure logs but doesn't kill the spawn
 	// (OS-wide ulimits still apply). Linux uses prlimit(2) for a
 	// RLIMIT_NOFILE cap; other platforms log a "not enforced" line.
-	applyChildResourceLimits(cmd.Process.Pid, s.logger)
+	applyChildResourceLimits(cmd.Process.Pid, s.childAddressSpaceLimit(), s.logger)
 	s.writeAuditLine(a, auditEvent{Event: "spawn", PID: cmd.Process.Pid, SHA256: a.Manifest.Binary.SHA256, BinaryAt: a.BinaryPath})
 
 	// Watch for the socket to appear; once it does, mark ready.
@@ -860,6 +963,18 @@ var ErrAppNotInstalled = errors.New("appstore: app not installed")
 // appeared yet (still starting up, or it crashed and hasn't respawned).
 var ErrAppNotReady = errors.New("appstore: app not ready")
 
+// ErrMethodNotExposed is returned by Call/CallFrom when the target app's
+// manifest does not list the requested method in its `exposes` set. The
+// exposes list is the app's entire broker surface, so calling anything
+// else is denied — even for trusted (daemon/pilotctl) callers.
+var ErrMethodNotExposed = errors.New("appstore: method not exposed by app")
+
+// ErrGrantMissing is returned by CallFrom when a cross-app caller does
+// not hold an `ipc.call` grant whose target matches "<app>.<method>".
+// Deny-by-default: an app may only reach methods it declared at install
+// time, and the user reviewed, in its manifest grants.
+var ErrGrantMissing = errors.New("appstore: caller lacks ipc.call grant for target")
+
 // Apps returns the public-shaped summary of every installed app, in
 // arbitrary order. Used by pilotctl's `appstore list` and by other
 // apps that want to introspect what's available.
@@ -894,17 +1009,57 @@ func (s *supervisor) Get(appID string) *installedApp {
 }
 
 // Call dispatches method+args into the named installed app via its
-// app.sock. The connection is dialed per-call — simple and lets the
-// app's own concurrency handle multiple in-flight calls. Returns
-// ErrAppNotInstalled / ErrAppNotReady for the obvious failure modes,
-// otherwise propagates the app's IPC response (or its error).
+// app.sock on behalf of a trusted caller (the daemon or pilotctl). It is
+// CallFrom with an empty callerID — the broker-surface (exposes) gate
+// still applies, but no cross-app ipc.call grant is required.
 func (s *supervisor) Call(ctx context.Context, appID, method string, args, out any) error {
+	return s.callFrom(ctx, "", appID, method, args, out)
+}
+
+// CallFrom dispatches method+args into the named installed app on behalf
+// of callerID. When callerID is non-empty the call is treated as a
+// cross-app ipc.call and is authorized against the caller's manifest
+// grants. When callerID is empty the caller is trusted (daemon/pilotctl)
+// and only the broker-surface gate applies.
+//
+// Authorization, all enforced before any socket is dialed:
+//  1. target app must be installed            → ErrAppNotInstalled
+//  2. method must be in the target's exposes   → ErrMethodNotExposed
+//  3. cross-app only: caller must be installed and hold an `ipc.call`
+//     grant matching "<app>.<method>"          → ErrGrantMissing
+func (s *supervisor) CallFrom(ctx context.Context, callerID, appID, method string, args, out any) error {
+	return s.callFrom(ctx, callerID, appID, method, args, out)
+}
+
+// callFrom is the shared implementation behind Call and CallFrom. The
+// connection is dialed per-call — simple and lets the app's own
+// concurrency handle multiple in-flight calls. Returns the typed gate
+// errors above, or otherwise propagates the app's IPC response/error.
+func (s *supervisor) callFrom(ctx context.Context, callerID, appID, method string, args, out any) error {
 	s.mu.RLock()
 	app, ok := s.installed[appID]
+	caller, callerOK := s.installed[callerID]
 	ready := s.ready[appID]
 	s.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("%w: %s", ErrAppNotInstalled, appID)
+	}
+	// Broker-surface gate: only methods the app explicitly exposes are
+	// dispatchable, for every caller including the daemon itself.
+	if !app.Manifest.ExposesMethod(method) {
+		return fmt.Errorf("%w: %s.%s", ErrMethodNotExposed, appID, method)
+	}
+	// Cross-app grant gate: a calling app must have declared an ipc.call
+	// grant targeting the specific method it wants to invoke. Trusted
+	// callers (empty callerID) skip this — they are the broker itself.
+	if callerID != "" {
+		if !callerOK {
+			return fmt.Errorf("%w: caller %q not installed", ErrGrantMissing, callerID)
+		}
+		target := appID + "." + method
+		if !caller.Manifest.HasGrant("ipc.call", target) {
+			return fmt.Errorf("%w: %s -> %s", ErrGrantMissing, callerID, target)
+		}
 	}
 	if !ready {
 		// Give it a brief moment in case it just spawned.

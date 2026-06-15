@@ -99,7 +99,7 @@ func TestSpawn_FastExitTriggersExitCode(t *testing.T) {
 	if err := os.MkdirAll(appDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	path, _ := fakeBinaryScript(t, appDir, "bin", 0, 0)
+	path, sum := fakeBinaryScript(t, appDir, "bin", 0, 0)
 
 	a := &installedApp{
 		Dir:        appDir,
@@ -109,6 +109,7 @@ func TestSpawn_FastExitTriggersExitCode(t *testing.T) {
 		IDPath:     filepath.Join(appDir, "identity.json"),
 		Manifest:   parseDummyManifest(t, "io.spawn.fast"),
 	}
+	a.Manifest.Binary.SHA256 = sum // pass the spawn-time TOCTOU re-verify
 	sup := newSupervisor(Config{InstallRoot: dir}, Deps{}, newQuietLogger(t))
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -128,7 +129,7 @@ func TestSpawn_NonZeroExitPropagates(t *testing.T) {
 	if err := os.MkdirAll(appDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	path, _ := fakeBinaryScript(t, appDir, "bin", 42, 0)
+	path, sum := fakeBinaryScript(t, appDir, "bin", 42, 0)
 
 	a := &installedApp{
 		Dir:        appDir,
@@ -138,6 +139,7 @@ func TestSpawn_NonZeroExitPropagates(t *testing.T) {
 		IDPath:     filepath.Join(appDir, "identity.json"),
 		Manifest:   parseDummyManifest(t, "io.spawn.exit42"),
 	}
+	a.Manifest.Binary.SHA256 = sum // pass the spawn-time TOCTOU re-verify
 	sup := newSupervisor(Config{InstallRoot: dir}, Deps{}, newQuietLogger(t))
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -157,14 +159,24 @@ func TestSpawn_StartFailure(t *testing.T) {
 	if err := os.MkdirAll(appDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	// A real, executable file whose pinned sha256 matches (so it passes
+	// the spawn-time TOCTOU re-verify) but whose interpreter is missing,
+	// so execve fails at cmd.Start — exercising the spawn-fail branch.
+	binPath := filepath.Join(appDir, "bin")
+	body := []byte("#!/nonexistent/interp-xyz-12345\n")
+	if err := os.WriteFile(binPath, body, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(body)
 	a := &installedApp{
 		Dir:        appDir,
-		BinaryPath: filepath.Join(appDir, "does-not-exist"),
+		BinaryPath: binPath,
 		SocketPath: filepath.Join(appDir, "app.sock"),
 		DBPath:     filepath.Join(appDir, "data.db"),
 		IDPath:     filepath.Join(appDir, "identity.json"),
 		Manifest:   parseDummyManifest(t, "io.spawn.nostart"),
 	}
+	a.Manifest.Binary.SHA256 = hex.EncodeToString(sum[:])
 	sup := newSupervisor(Config{InstallRoot: dir}, Deps{}, newQuietLogger(t))
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
@@ -195,7 +207,7 @@ func TestSpawn_StaleSocketIsCleaned(t *testing.T) {
 	if err := os.WriteFile(socketPath, []byte("stale"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	path, _ := fakeBinaryScript(t, appDir, "bin", 0, 0)
+	path, sum := fakeBinaryScript(t, appDir, "bin", 0, 0)
 
 	a := &installedApp{
 		Dir:        appDir,
@@ -205,6 +217,7 @@ func TestSpawn_StaleSocketIsCleaned(t *testing.T) {
 		IDPath:     filepath.Join(appDir, "identity.json"),
 		Manifest:   parseDummyManifest(t, "io.spawn.stale"),
 	}
+	a.Manifest.Binary.SHA256 = sum // pass the spawn-time TOCTOU re-verify
 	sup := newSupervisor(Config{InstallRoot: dir}, Deps{}, newQuietLogger(t))
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -565,7 +578,7 @@ func TestApplyChildResourceLimits_Smoke(t *testing.T) {
 	t.Parallel()
 	// Pass an invalid PID; the function is best-effort and must not panic.
 	logger := newQuietLogger(t)
-	applyChildResourceLimits(0, logger)
+	applyChildResourceLimits(0, defaultChildAddressSpaceLimit, logger)
 }
 
 // TestService_AppsBeforeStart returns nil per the docstring.
@@ -668,12 +681,14 @@ func TestSupervisor_Call_DialFailsWhenNoServer(t *testing.T) {
 	if err := os.MkdirAll(appDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	md := parseDummyManifest(t, "io.dial.fail")
+	md.Exposes = []string{"any"}
 	sup := newSupervisor(Config{InstallRoot: dir}, Deps{}, newQuietLogger(t))
 	sup.mu.Lock()
 	sup.installed["io.dial.fail"] = &installedApp{
 		Dir:        appDir,
 		SocketPath: filepath.Join(appDir, "missing.sock"),
-		Manifest:   parseDummyManifest(t, "io.dial.fail"),
+		Manifest:   md,
 	}
 	sup.ready["io.dial.fail"] = true
 	sup.mu.Unlock()

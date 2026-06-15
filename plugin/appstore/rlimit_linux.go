@@ -27,29 +27,44 @@ type rlimit64 struct {
 	Max uint64
 }
 
-// applyChildResourceLimits sets RLIMIT_NOFILE on a freshly-spawned
-// child after exec. Best-effort: a failure logs but doesn't kill the
-// spawn — the OS-wide ulimit still applies. We use prlimit (not
-// setrlimit) because the parent (supervisor) doesn't want to bound
-// its own fd count; we only want to bound the child's.
+// applyChildResourceLimits sets resource limits on a freshly-spawned
+// child after exec, via prlimit(2) targeting the child pid (so the
+// supervisor's own limits are untouched). Best-effort: any failure logs
+// but does not kill the spawn — the OS-wide ulimit still applies.
+//
+//   - RLIMIT_NOFILE is always set to childFDLimit.
+//   - RLIMIT_AS (virtual address space) is set to addrSpaceLimit when it
+//     is non-zero. NOTE: RLIMIT_AS bounds *address space*, not RSS.
+//     Runtime-managed languages (Go, Node/V8, Python) reserve large
+//     virtual regions well above their working set, so the cap must be
+//     generous — a too-low value makes the runtime fail to mmap and the
+//     child crashes on startup. The supervisor's default
+//     (defaultChildAddressSpaceLimit) is chosen with that headroom.
 //
 // There is a tiny race: between cmd.Start and prlimit landing, the
-// child can open more fds. For a wallet-class app starting from a
-// clean state, that's a handful at most — well under the cap.
-func applyChildResourceLimits(pid int, logger *log.Logger) {
-	want := rlimit64{Cur: childFDLimit, Max: childFDLimit}
-	// SYS_PRLIMIT64 takes (pid, resource, *new_limit, *old_limit).
-	// We don't care about the old limit; pass a nil out-pointer.
-	_, _, errno := syscall.Syscall6(
-		syscall.SYS_PRLIMIT64,
-		uintptr(pid),
-		uintptr(syscall.RLIMIT_NOFILE),
-		uintptr(unsafe.Pointer(&want)),
-		0, 0, 0,
-	)
-	if errno != 0 {
-		logger.Printf("prlimit pid=%d RLIMIT_NOFILE=%d: %v (proceeding; OS-wide ulimit still applies)", pid, childFDLimit, errno)
-		return
+// child can allocate. For an app starting from a clean state that's a
+// handful of fds / a small allocation — well under the caps.
+func applyChildResourceLimits(pid int, addrSpaceLimit uint64, logger *log.Logger) {
+	setLimit := func(resource int, name string, val uint64) {
+		want := rlimit64{Cur: val, Max: val}
+		// SYS_PRLIMIT64 takes (pid, resource, *new_limit, *old_limit).
+		// We don't care about the old limit; pass a nil out-pointer.
+		_, _, errno := syscall.Syscall6(
+			syscall.SYS_PRLIMIT64,
+			uintptr(pid),
+			uintptr(resource),
+			uintptr(unsafe.Pointer(&want)),
+			0, 0, 0,
+		)
+		if errno != 0 {
+			logger.Printf("prlimit pid=%d %s=%d: %v (proceeding; OS-wide ulimit still applies)", pid, name, val, errno)
+			return
+		}
+		logger.Printf("prlimit pid=%d %s=%d ok", pid, name, val)
 	}
-	logger.Printf("prlimit pid=%d RLIMIT_NOFILE=%d ok", pid, childFDLimit)
+
+	setLimit(syscall.RLIMIT_NOFILE, "RLIMIT_NOFILE", childFDLimit)
+	if addrSpaceLimit > 0 {
+		setLimit(syscall.RLIMIT_AS, "RLIMIT_AS", addrSpaceLimit)
+	}
 }
