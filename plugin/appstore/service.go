@@ -57,6 +57,14 @@ type Config struct {
 	// defaultAuditLogBackups (3). Worst-case per-app footprint is
 	// (AuditLogMaxBackups+1) × AuditLogMaxBytes.
 	AuditLogMaxBackups int
+
+	// ChildMemoryLimitBytes caps the virtual address space (RLIMIT_AS)
+	// of each spawned app process on Linux. Zero defaults to
+	// defaultChildAddressSpaceLimit (4 GiB). No-op on non-Linux
+	// platforms. Set generously — RLIMIT_AS bounds address space, not
+	// RSS, and runtime-managed languages reserve far more virtual
+	// memory than they use.
+	ChildMemoryLimitBytes uint64
 }
 
 // EmbeddedCatalogPubkey is the production trust anchor for the catalog.

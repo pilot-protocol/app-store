@@ -565,7 +565,7 @@ func TestApplyChildResourceLimits_Smoke(t *testing.T) {
 	t.Parallel()
 	// Pass an invalid PID; the function is best-effort and must not panic.
 	logger := newQuietLogger(t)
-	applyChildResourceLimits(0, logger)
+	applyChildResourceLimits(0, defaultChildAddressSpaceLimit, logger)
 }
 
 // TestService_AppsBeforeStart returns nil per the docstring.

@@ -41,6 +41,14 @@ const supervisorLogRotated = "supervisor.log.1"
 // without unbounded disk growth.
 const defaultAuditLogBackups = 3
 
+// defaultChildAddressSpaceLimit is the RLIMIT_AS cap applied to spawned
+// app processes when Config.ChildMemoryLimitBytes is unset. 4 GiB is
+// generous enough for Go/Node/Python runtime virtual reservations (a
+// trivial Go binary needs ~1 GiB of address space) while still bounding
+// a runaway / hostile app well below host memory. Linux-only; see
+// rlimit_linux.go.
+const defaultChildAddressSpaceLimit uint64 = 4 << 30
+
 // maxAuditLogSize bounds each app's active audit log. A crash-looping
 // app emits ~5 lines per failed spawn cycle (verify-fail / exit /
 // spawn / spawn-fail / supervise-stop), each ~150B, so 10MB is
@@ -676,6 +684,15 @@ func atoiOrZero(s string) int {
 	return n
 }
 
+// childAddressSpaceLimit resolves the RLIMIT_AS cap for spawned apps:
+// the configured value, or defaultChildAddressSpaceLimit when unset.
+func (s *supervisor) childAddressSpaceLimit() uint64 {
+	if s.cfg.ChildMemoryLimitBytes > 0 {
+		return s.cfg.ChildMemoryLimitBytes
+	}
+	return defaultChildAddressSpaceLimit
+}
+
 // nextBackoff doubles cur, capping at max. Shared by superviseOne's
 // crash-restart and verify-fail backoff ramps so both grow identically.
 func nextBackoff(cur, max time.Duration) time.Duration {
@@ -859,7 +876,7 @@ func (s *supervisor) spawn(ctx context.Context, a *installedApp) int {
 	// child. Best-effort: a failure logs but doesn't kill the spawn
 	// (OS-wide ulimits still apply). Linux uses prlimit(2) for a
 	// RLIMIT_NOFILE cap; other platforms log a "not enforced" line.
-	applyChildResourceLimits(cmd.Process.Pid, s.logger)
+	applyChildResourceLimits(cmd.Process.Pid, s.childAddressSpaceLimit(), s.logger)
 	s.writeAuditLine(a, auditEvent{Event: "spawn", PID: cmd.Process.Pid, SHA256: a.Manifest.Binary.SHA256, BinaryAt: a.BinaryPath})
 
 	// Watch for the socket to appear; once it does, mark ready.
