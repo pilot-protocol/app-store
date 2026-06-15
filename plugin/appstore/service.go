@@ -234,3 +234,21 @@ func (s *Service) Call(ctx context.Context, appID, method string, args, out any)
 	}
 	return sup.Call(ctx, appID, method, args, out)
 }
+
+// CallFrom is the cross-app broker entry point. callerID identifies the
+// installed app making the request; the supervisor authorizes the call
+// against that app's manifest grants (it must declare an `ipc.call` grant
+// targeting "<appID>.<method>"). Pass an empty callerID for trusted
+// daemon/pilotctl calls — see Call.
+//
+// Returns ErrAppNotInstalled, ErrMethodNotExposed, ErrGrantMissing, or
+// ErrAppNotReady for the gate failures; otherwise the app's IPC response.
+func (s *Service) CallFrom(ctx context.Context, callerID, appID, method string, args, out any) error {
+	s.startMu.Lock()
+	sup := s.sup
+	s.startMu.Unlock()
+	if sup == nil {
+		return errors.New("appstore: service not started")
+	}
+	return sup.CallFrom(ctx, callerID, appID, method, args, out)
+}

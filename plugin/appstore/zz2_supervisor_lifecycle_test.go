@@ -668,12 +668,14 @@ func TestSupervisor_Call_DialFailsWhenNoServer(t *testing.T) {
 	if err := os.MkdirAll(appDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	md := parseDummyManifest(t, "io.dial.fail")
+	md.Exposes = []string{"any"}
 	sup := newSupervisor(Config{InstallRoot: dir}, Deps{}, newQuietLogger(t))
 	sup.mu.Lock()
 	sup.installed["io.dial.fail"] = &installedApp{
 		Dir:        appDir,
 		SocketPath: filepath.Join(appDir, "missing.sock"),
-		Manifest:   parseDummyManifest(t, "io.dial.fail"),
+		Manifest:   md,
 	}
 	sup.ready["io.dial.fail"] = true
 	sup.mu.Unlock()

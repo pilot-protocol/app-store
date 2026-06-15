@@ -59,10 +59,12 @@ func TestSupervisor_Call_NotReady(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	sup := newSupervisor(Config{InstallRoot: dir}, Deps{}, newQuietLogger(t))
+	m := parseDummyManifest(t, "io.test.app")
+	m.Exposes = []string{"method"} // method must be exposed to reach the ready gate
 	sup.mu.Lock()
 	sup.installed["io.test.app"] = &installedApp{
 		Dir:      dir,
-		Manifest: parseDummyManifest(t, "io.test.app"),
+		Manifest: m,
 	}
 	sup.mu.Unlock()
 

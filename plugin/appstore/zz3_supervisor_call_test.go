@@ -77,12 +77,14 @@ func TestSupervisor_Call_HappyPath(t *testing.T) {
 		})
 	defer cleanup()
 
+	mh := parseDummyManifest(t, "io.call.happy")
+	mh.Exposes = []string{"echo"}
 	sup := newSupervisor(Config{InstallRoot: dir}, Deps{}, newQuietLogger(t))
 	sup.mu.Lock()
 	sup.installed["io.call.happy"] = &installedApp{
 		Dir:        appDir,
 		SocketPath: socketPath,
-		Manifest:   parseDummyManifest(t, "io.call.happy"),
+		Manifest:   mh,
 	}
 	sup.ready["io.call.happy"] = true
 	sup.mu.Unlock()
@@ -114,12 +116,14 @@ func TestSupervisor_Call_PropagatesServerError(t *testing.T) {
 		})
 	defer cleanup()
 
+	me := parseDummyManifest(t, "io.call.err")
+	me.Exposes = []string{"boom"}
 	sup := newSupervisor(Config{InstallRoot: dir}, Deps{}, newQuietLogger(t))
 	sup.mu.Lock()
 	sup.installed["io.call.err"] = &installedApp{
 		Dir:        appDir,
 		SocketPath: socketPath,
-		Manifest:   parseDummyManifest(t, "io.call.err"),
+		Manifest:   me,
 	}
 	sup.ready["io.call.err"] = true
 	sup.mu.Unlock()

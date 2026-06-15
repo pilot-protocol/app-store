@@ -860,6 +860,18 @@ var ErrAppNotInstalled = errors.New("appstore: app not installed")
 // appeared yet (still starting up, or it crashed and hasn't respawned).
 var ErrAppNotReady = errors.New("appstore: app not ready")
 
+// ErrMethodNotExposed is returned by Call/CallFrom when the target app's
+// manifest does not list the requested method in its `exposes` set. The
+// exposes list is the app's entire broker surface, so calling anything
+// else is denied — even for trusted (daemon/pilotctl) callers.
+var ErrMethodNotExposed = errors.New("appstore: method not exposed by app")
+
+// ErrGrantMissing is returned by CallFrom when a cross-app caller does
+// not hold an `ipc.call` grant whose target matches "<app>.<method>".
+// Deny-by-default: an app may only reach methods it declared at install
+// time, and the user reviewed, in its manifest grants.
+var ErrGrantMissing = errors.New("appstore: caller lacks ipc.call grant for target")
+
 // Apps returns the public-shaped summary of every installed app, in
 // arbitrary order. Used by pilotctl's `appstore list` and by other
 // apps that want to introspect what's available.
@@ -894,17 +906,57 @@ func (s *supervisor) Get(appID string) *installedApp {
 }
 
 // Call dispatches method+args into the named installed app via its
-// app.sock. The connection is dialed per-call — simple and lets the
-// app's own concurrency handle multiple in-flight calls. Returns
-// ErrAppNotInstalled / ErrAppNotReady for the obvious failure modes,
-// otherwise propagates the app's IPC response (or its error).
+// app.sock on behalf of a trusted caller (the daemon or pilotctl). It is
+// CallFrom with an empty callerID — the broker-surface (exposes) gate
+// still applies, but no cross-app ipc.call grant is required.
 func (s *supervisor) Call(ctx context.Context, appID, method string, args, out any) error {
+	return s.callFrom(ctx, "", appID, method, args, out)
+}
+
+// CallFrom dispatches method+args into the named installed app on behalf
+// of callerID. When callerID is non-empty the call is treated as a
+// cross-app ipc.call and is authorized against the caller's manifest
+// grants. When callerID is empty the caller is trusted (daemon/pilotctl)
+// and only the broker-surface gate applies.
+//
+// Authorization, all enforced before any socket is dialed:
+//  1. target app must be installed            → ErrAppNotInstalled
+//  2. method must be in the target's exposes   → ErrMethodNotExposed
+//  3. cross-app only: caller must be installed and hold an `ipc.call`
+//     grant matching "<app>.<method>"          → ErrGrantMissing
+func (s *supervisor) CallFrom(ctx context.Context, callerID, appID, method string, args, out any) error {
+	return s.callFrom(ctx, callerID, appID, method, args, out)
+}
+
+// callFrom is the shared implementation behind Call and CallFrom. The
+// connection is dialed per-call — simple and lets the app's own
+// concurrency handle multiple in-flight calls. Returns the typed gate
+// errors above, or otherwise propagates the app's IPC response/error.
+func (s *supervisor) callFrom(ctx context.Context, callerID, appID, method string, args, out any) error {
 	s.mu.RLock()
 	app, ok := s.installed[appID]
+	caller, callerOK := s.installed[callerID]
 	ready := s.ready[appID]
 	s.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("%w: %s", ErrAppNotInstalled, appID)
+	}
+	// Broker-surface gate: only methods the app explicitly exposes are
+	// dispatchable, for every caller including the daemon itself.
+	if !app.Manifest.ExposesMethod(method) {
+		return fmt.Errorf("%w: %s.%s", ErrMethodNotExposed, appID, method)
+	}
+	// Cross-app grant gate: a calling app must have declared an ipc.call
+	// grant targeting the specific method it wants to invoke. Trusted
+	// callers (empty callerID) skip this — they are the broker itself.
+	if callerID != "" {
+		if !callerOK {
+			return fmt.Errorf("%w: caller %q not installed", ErrGrantMissing, callerID)
+		}
+		target := appID + "." + method
+		if !caller.Manifest.HasGrant("ipc.call", target) {
+			return fmt.Errorf("%w: %s -> %s", ErrGrantMissing, callerID, target)
+		}
 	}
 	if !ready {
 		// Give it a brief moment in case it just spawned.
