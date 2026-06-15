@@ -47,10 +47,16 @@ type Config struct {
 	RescanInterval time.Duration
 
 	// AuditLogMaxBytes is the per-app supervisor.log size threshold
-	// at which a single-step rotation fires (active → .1). Zero
-	// defaults to maxAuditLogSize (10MB). Tests set this low to
-	// exercise the rotation path without writing megabytes.
+	// at which rotation fires (active → .1). Zero defaults to
+	// maxAuditLogSize (10MB). Tests set this low to exercise the
+	// rotation path without writing megabytes.
 	AuditLogMaxBytes int64
+
+	// AuditLogMaxBackups is the number of rotated generations the
+	// supervisor keeps (supervisor.log.1 .. .N). Zero defaults to
+	// defaultAuditLogBackups (3). Worst-case per-app footprint is
+	// (AuditLogMaxBackups+1) × AuditLogMaxBytes.
+	AuditLogMaxBackups int
 }
 
 // EmbeddedCatalogPubkey is the production trust anchor for the catalog.

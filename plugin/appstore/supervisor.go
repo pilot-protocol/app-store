@@ -28,12 +28,18 @@ import (
 // `pilotctl appstore audit <id>` can read it without daemon glue.
 const supervisorLogName = "supervisor.log"
 
-// supervisorLogRotated is the single-step rotation target. On reaching
-// maxAuditLogSize, writeAuditLine moves supervisor.log here (overwriting
-// any prior copy) and starts fresh. Single-step keeps the design simple:
-// worst-case footprint is 2 × maxAuditLogSize per app, plenty of history
-// for an incident, and no log.2/log.3 chain to manage.
+// supervisorLogRotated is the first rotated generation (supervisor.log.1).
+// On reaching the size threshold the active log shifts to .1, the prior
+// .1 shifts to .2, and so on up to the configured backup count; the
+// oldest generation beyond that is discarded. Worst-case footprint is
+// (backups+1) × maxAuditLogSize per app.
 const supervisorLogRotated = "supervisor.log.1"
+
+// defaultAuditLogBackups is the number of rotated generations kept
+// (supervisor.log.1 .. .N) when Config.AuditLogMaxBackups is unset.
+// Three generations + the active log keeps a useful incident window
+// without unbounded disk growth.
+const defaultAuditLogBackups = 3
 
 // maxAuditLogSize bounds each app's active audit log. A crash-looping
 // app emits ~5 lines per failed spawn cycle (verify-fail / exit /
@@ -80,10 +86,12 @@ func (s *supervisor) writeAuditLine(a *installedApp, ev auditEvent) {
 	}
 }
 
-// rotateAuditIfLarge renames supervisor.log → supervisor.log.1 when
-// the active log has crossed the configured size threshold. The
-// threshold defaults to maxAuditLogSize but can be lowered for tests
-// via supervisor.cfg.AuditLogMaxBytes. Errors are logged but never
+// rotateAuditIfLarge rotates the audit log when the active
+// supervisor.log has crossed the configured size threshold, keeping up
+// to N rotated generations (supervisor.log.1 .. .N). The threshold
+// defaults to maxAuditLogSize and the generation count to
+// defaultAuditLogBackups; both can be overridden via Config
+// (AuditLogMaxBytes / AuditLogMaxBackups). Errors are logged but never
 // fatal — forensics best-effort, never blocks the lifecycle write.
 func (s *supervisor) rotateAuditIfLarge(appDir string) {
 	max := int64(maxAuditLogSize)
@@ -98,12 +106,43 @@ func (s *supervisor) rotateAuditIfLarge(appDir string) {
 	if info.Size() < max {
 		return
 	}
-	rotated := filepath.Join(appDir, supervisorLogRotated)
-	// os.Rename replaces the destination atomically on Unix, so a
-	// concurrent reader of the rotated path will see either the old
-	// or the new one — never a partial file.
-	if err := os.Rename(active, rotated); err != nil {
-		s.logger.Printf("audit rotate %s → %s: %v", active, rotated, err)
+	keep := defaultAuditLogBackups
+	if s.cfg.AuditLogMaxBackups > 0 {
+		keep = s.cfg.AuditLogMaxBackups
+	}
+	s.rotateGenerations(appDir, keep)
+}
+
+// rotateGenerations shifts the audit log generations down by one,
+// keeping at most `keep` rotated copies: supervisor.log.(keep) is
+// discarded, .(keep-1)→.keep, …, .1→.2, and the active
+// supervisor.log→.1. Each os.Rename replaces its destination
+// atomically on Unix, so a concurrent reader of any generation sees a
+// whole file, never a partial one. Errors are logged, never fatal.
+func (s *supervisor) rotateGenerations(appDir string, keep int) {
+	if keep < 1 {
+		keep = 1
+	}
+	gen := func(i int) string {
+		if i == 0 {
+			return filepath.Join(appDir, supervisorLogName)
+		}
+		return filepath.Join(appDir, fmt.Sprintf("%s.%d", supervisorLogName, i))
+	}
+	// Discard the generation that would fall off the end.
+	if err := os.Remove(gen(keep)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		s.logger.Printf("audit rotate: remove %s: %v", gen(keep), err)
+	}
+	// Shift each surviving generation down one slot, oldest first so we
+	// never clobber a file we still need to move.
+	for i := keep - 1; i >= 0; i-- {
+		src, dst := gen(i), gen(i+1)
+		if _, err := os.Stat(src); errors.Is(err, os.ErrNotExist) {
+			continue // gap in the chain — nothing to move
+		}
+		if err := os.Rename(src, dst); err != nil {
+			s.logger.Printf("audit rotate %s → %s: %v", src, dst, err)
+		}
 	}
 }
 
