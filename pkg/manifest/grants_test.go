@@ -33,13 +33,13 @@ func TestHasGrant(t *testing.T) {
 		want        bool
 	}
 	for _, c := range []tc{
-		{"ipc.call", "io.pilot.wallet.pay", true},   // exact
+		{"ipc.call", "io.pilot.wallet.pay", true},     // exact
 		{"ipc.call", "io.pilot.wallet.refund", false}, // exact mismatch
-		{"ipc.call", "io.pilot.notes.add", true},    // prefix.*
-		{"ipc.call", "io.pilot.notes.list", true},   // prefix.*
-		{"ipc.call", "io.pilot.notesX.add", false},  // prefix must end at dot
-		{"fs.read", "anything.at.all", true},        // blanket *
-		{"net.dial", "io.pilot.wallet.pay", false},  // cap mismatch
+		{"ipc.call", "io.pilot.notes.add", true},      // prefix.*
+		{"ipc.call", "io.pilot.notes.list", true},     // prefix.*
+		{"ipc.call", "io.pilot.notesX.add", false},    // prefix must end at dot
+		{"fs.read", "anything.at.all", true},          // blanket *
+		{"net.dial", "io.pilot.wallet.pay", false},    // cap mismatch
 	} {
 		if got := m.HasGrant(c.cap, c.target); got != c.want {
 			t.Errorf("HasGrant(%q,%q) = %v, want %v", c.cap, c.target, got, c.want)
