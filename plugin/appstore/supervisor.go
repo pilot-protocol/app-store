@@ -637,6 +637,16 @@ func atoiOrZero(s string) int {
 	return n
 }
 
+// nextBackoff doubles cur, capping at max. Shared by superviseOne's
+// crash-restart and verify-fail backoff ramps so both grow identically.
+func nextBackoff(cur, max time.Duration) time.Duration {
+	next := cur * 2
+	if next > max {
+		return max
+	}
+	return next
+}
+
 // superviseOne runs one app forever, respawning on exit until ctx is canceled.
 func (s *supervisor) superviseOne(ctx context.Context, a *installedApp) {
 	// Mark the start + end of supervision. The pair tells forensics
@@ -671,6 +681,11 @@ func (s *supervisor) superviseOne(ctx context.Context, a *installedApp) {
 	}()
 	backoff := time.Second
 	const maxBackoff = 30 * time.Second
+	// verifyBackoff grows independently of the crash-restart backoff so a
+	// binary that fails sha256 verification doesn't hammer the disk every
+	// 30s — it ramps 1s→2s→4s…→30s, consistent with crash-loop handling,
+	// and resets the moment a verification succeeds.
+	verifyBackoff := time.Second
 	verifyFails := 0
 	for {
 		if err := ctx.Err(); err != nil {
@@ -690,17 +705,20 @@ func (s *supervisor) superviseOne(ctx context.Context, a *installedApp) {
 				s.markSuspended(a.Manifest.ID)
 				return
 			}
-			// A bad sha256 may be transient; wait + retry in case
-			// the user fixes it (e.g. re-install).
+			// A bad sha256 may be transient; wait + retry with capped
+			// exponential backoff in case the user fixes it (re-install).
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(maxBackoff):
-				continue
+			case <-time.After(verifyBackoff):
 			}
+			verifyBackoff = nextBackoff(verifyBackoff, maxBackoff)
+			continue
 		}
-		// verify passed — reset the consecutive-fail counter.
+		// verify passed — reset the consecutive-fail counter and the
+		// verify backoff so a later transient failure starts fresh.
 		verifyFails = 0
+		verifyBackoff = time.Second
 		exitCode := s.spawn(ctx, a)
 		s.markNotReady(a.Manifest.ID)
 		s.writeAuditLine(a, auditEvent{Event: "exit", ExitCode: exitCode})
@@ -728,10 +746,7 @@ func (s *supervisor) superviseOne(ctx context.Context, a *installedApp) {
 			return
 		case <-time.After(backoff):
 		}
-		backoff *= 2
-		if backoff > maxBackoff {
-			backoff = maxBackoff
-		}
+		backoff = nextBackoff(backoff, maxBackoff)
 	}
 }
 
