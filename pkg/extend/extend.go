@@ -115,7 +115,16 @@ type Registry struct {
 
 	mu      sync.RWMutex
 	byPoint map[HookPoint][]Extension
+
+	// limiter, when non-nil, rate-limits hook dispatch per app in Run.
+	// Nil = unlimited (default); enable via SetRateLimit.
+	limiter *rateLimiter
 }
+
+// ErrRateLimited is returned by Run when an app's hook-invocation rate
+// budget is exhausted. The chain aborts rather than dispatch into an app
+// that's being called too aggressively.
+var ErrRateLimited = errors.New("extend: hook rate limit exceeded")
 
 // NewRegistry constructs an empty Registry. dispatch is required.
 func NewRegistry(dispatch Dispatcher) *Registry {
@@ -131,6 +140,38 @@ func NewRegistry(dispatch Dispatcher) *Registry {
 		dispatch: dispatch,
 		byPoint:  map[HookPoint][]Extension{},
 	}
+}
+
+// SetRateLimit enables per-app hook-dispatch rate limiting: each app may
+// fire `burst` hook invocations instantly and `ratePerSec` sustained
+// thereafter. Once an app's budget is exhausted, Run aborts that app's
+// hook with ErrRateLimited. Call with a non-positive rate or burst to
+// disable. Intended to be set once at daemon wire-up.
+func (r *Registry) SetRateLimit(ratePerSec float64, burst int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if ratePerSec <= 0 || burst <= 0 {
+		r.limiter = nil
+		return
+	}
+	r.limiter = newRateLimiter(ratePerSec, burst)
+}
+
+// CountForApp returns the number of currently-registered extensions
+// belonging to appID across all hook points. Used to bound how many
+// dynamic registrations a single app may hold.
+func (r *Registry) CountForApp(appID string) int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	n := 0
+	for _, list := range r.byPoint {
+		for _, ext := range list {
+			if ext.AppID == appID {
+				n++
+			}
+		}
+	}
+	return n
 }
 
 // Register adds one extension to the registry. Returns an error if
@@ -239,10 +280,16 @@ func (r *Registry) FlagsFor(p HookPoint) []FlagSpec {
 // the hook may have populated, then cleared.
 func (r *Registry) Run(ctx context.Context, p HookPoint, args HookArgs) (HookArgs, error) {
 	hooks := r.HooksFor(p)
+	r.mu.RLock()
+	lim := r.limiter
+	r.mu.RUnlock()
 	current := args
 	for _, h := range hooks {
 		if err := ctx.Err(); err != nil {
 			return current, err
+		}
+		if lim != nil && !lim.allow(h.AppID) {
+			return current, fmt.Errorf("extend %s: hook %s.%s: %w", p, h.AppID, h.Method, ErrRateLimited)
 		}
 		next, err := r.dispatch(ctx, h.AppID, h.Method, cloneArgs(current))
 		if err != nil {
