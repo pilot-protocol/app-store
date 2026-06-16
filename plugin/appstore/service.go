@@ -135,12 +135,13 @@ func (s *Service) Order() int { return 120 }
 // Go's structural typing makes this work as long as the methods used here
 // are present on the real types.
 type Deps struct {
-	Streams  any // coreapi.Streams — Dial, Listen, SendDatagram
-	Identity any // coreapi.Identity — NodeID, Address, PublicKey, Sign
-	Resolver any
-	Events   any // coreapi.EventBus — Publish, Subscribe
-	Logger   any
-	Trust    any
+	Streams    any // coreapi.Streams — Dial, Listen, SendDatagram
+	Identity   any // coreapi.Identity — NodeID, Address, PublicKey, Sign
+	Resolver   any
+	Events     any // coreapi.EventBus — Publish, Subscribe
+	Logger     any
+	Trust      any
+	Telemetry  TelemetryEmitter // optional; no-op when nil
 }
 
 // Start scans InstallRoot for installed apps, verifies each binary's

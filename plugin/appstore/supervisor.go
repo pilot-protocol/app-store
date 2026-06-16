@@ -171,6 +171,10 @@ type supervisor struct {
 }
 
 func newSupervisor(cfg Config, deps Deps, logger *log.Logger) *supervisor {
+	// Default no-op telemetry when the daemon doesn't wire one.
+	if deps.Telemetry == nil {
+		deps.Telemetry = noopEmitter{}
+	}
 	return &supervisor{
 		cfg:       cfg,
 		deps:      deps,
@@ -1035,6 +1039,9 @@ func (s *supervisor) CallFrom(ctx context.Context, callerID, appID, method strin
 // connection is dialed per-call — simple and lets the app's own
 // concurrency handle multiple in-flight calls. Returns the typed gate
 // errors above, or otherwise propagates the app's IPC response/error.
+//
+// After every call (success or failure) a telemetry usage event is
+// emitted — best-effort, never blocks the caller.
 func (s *supervisor) callFrom(ctx context.Context, callerID, appID, method string, args, out any) error {
 	s.mu.RLock()
 	app, ok := s.installed[appID]
@@ -1042,29 +1049,39 @@ func (s *supervisor) callFrom(ctx context.Context, callerID, appID, method strin
 	ready := s.ready[appID]
 	s.mu.RUnlock()
 	if !ok {
-		return fmt.Errorf("%w: %s", ErrAppNotInstalled, appID)
+		err := fmt.Errorf("%w: %s", ErrAppNotInstalled, appID)
+		s.emitUsage(callerID, appID, method, false, 0, err.Error())
+		return err
 	}
 	// Broker-surface gate: only methods the app explicitly exposes are
 	// dispatchable, for every caller including the daemon itself.
 	if !app.Manifest.ExposesMethod(method) {
-		return fmt.Errorf("%w: %s.%s", ErrMethodNotExposed, appID, method)
+		err := fmt.Errorf("%w: %s.%s", ErrMethodNotExposed, appID, method)
+		s.emitUsage(callerID, appID, method, false, 0, err.Error())
+		return err
 	}
 	// Cross-app grant gate: a calling app must have declared an ipc.call
 	// grant targeting the specific method it wants to invoke. Trusted
 	// callers (empty callerID) skip this — they are the broker itself.
 	if callerID != "" {
 		if !callerOK {
-			return fmt.Errorf("%w: caller %q not installed", ErrGrantMissing, callerID)
+			err := fmt.Errorf("%w: caller %q not installed", ErrGrantMissing, callerID)
+			s.emitUsage(callerID, appID, method, false, 0, err.Error())
+			return err
 		}
 		target := appID + "." + method
 		if !caller.Manifest.HasGrant("ipc.call", target) {
-			return fmt.Errorf("%w: %s -> %s", ErrGrantMissing, callerID, target)
+			err := fmt.Errorf("%w: %s -> %s", ErrGrantMissing, callerID, target)
+			s.emitUsage(callerID, appID, method, false, 0, err.Error())
+			return err
 		}
 	}
 	if !ready {
 		// Give it a brief moment in case it just spawned.
 		if !s.awaitReady(ctx, appID, 1*time.Second) {
-			return fmt.Errorf("%w: %s", ErrAppNotReady, appID)
+			err := fmt.Errorf("%w: %s", ErrAppNotReady, appID)
+			s.emitUsage(callerID, appID, method, false, 0, err.Error())
+			return err
 		}
 	}
 
@@ -1082,7 +1099,39 @@ func (s *supervisor) callFrom(ctx context.Context, callerID, appID, method strin
 	if dl, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(dl)
 	}
-	return ipc.Call(conn, method, args, out)
+
+	start := time.Now()
+	err = ipc.Call(conn, method, args, out)
+	dur := time.Since(start).Milliseconds()
+	if err != nil {
+		s.emitUsage(callerID, appID, method, false, dur, err.Error())
+	} else {
+		s.emitUsage(callerID, appID, method, true, dur, "")
+	}
+	return err
+}
+
+// emitUsage best-effort fires a telemetry event into the Deps.Telemetry
+// emitter. It never blocks and recovers from emitter panics so a buggy
+// downstream never sinks the supervisor call path.
+func (s *supervisor) emitUsage(callerID, appID, method string, ok bool, durMs int64, errMsg string) {
+	t := s.deps.Telemetry
+	if t == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Printf("telemetry emitter panicked: %v", r)
+		}
+	}()
+	t.Emit(TelemetryEvent{
+		AppID:    appID,
+		Method:   method,
+		CallerID: callerID,
+		OK:       ok,
+		DurMs:    durMs,
+		ErrMsg:   errMsg,
+	})
 }
 
 // awaitReady polls the ready bit for app until it flips true or the
