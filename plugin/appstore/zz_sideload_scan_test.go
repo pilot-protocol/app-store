@@ -124,3 +124,27 @@ func TestScanInstalled_UnsignedWithoutMarkerStillRejected(t *testing.T) {
 		t.Fatalf("apps = %d, want 0 (unsigned manifest without sideload marker must be refused)", len(apps))
 	}
 }
+
+// TestScanInstalled_UntrustedPublisherWithoutMarkerRejected is the
+// trust-boundary regression: a manifest whose signature VERIFIES but
+// whose publisher is NOT on the trusted-publishers list, with no
+// `.sideloaded` marker, must be refused. Signature validity alone is
+// not trust — a non-sideloaded (catalogue) install must satisfy the
+// full trust-anchor check. Before the fix, scanInstalled ran only
+// VerifySignature on the catalogue path, so a self-signed-by-anyone
+// manifest was silently accepted and spawned.
+func TestScanInstalled_UntrustedPublisherWithoutMarkerRejected(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	// Valid self-signature, fresh untrusted key, NO .sideloaded marker.
+	writeUntrustedSignedAppDir(t, root, "io.untrusted.app")
+
+	sup := newSupervisor(Config{InstallRoot: root}, Deps{}, newQuietLogger(t))
+	apps, err := sup.scanInstalled()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(apps) != 0 {
+		t.Fatalf("apps = %d, want 0 (validly-signed but UNTRUSTED publisher must be refused on the catalogue path)", len(apps))
+	}
+}

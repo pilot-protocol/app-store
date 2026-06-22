@@ -2,7 +2,6 @@ package appstore
 
 import (
 	"crypto/ed25519"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -159,10 +158,7 @@ func writeAppDirWithVersion(t *testing.T, root, id, version string) string {
 		t.Fatal(err)
 	}
 
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("generate key: %v", err)
-	}
+	pub, priv := testPublisherKey()
 	pubB64 := base64.StdEncoding.EncodeToString(pub)
 
 	template := fmt.Sprintf(
