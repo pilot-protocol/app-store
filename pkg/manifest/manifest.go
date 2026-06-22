@@ -75,10 +75,12 @@ type Binary struct {
 // every privileged op and grants are the only thing that authorizes them.
 type Grant struct {
 	// Cap: "fs.read" | "fs.write" | "net.dial" | "net.call" | "ipc.call" |
-	//      "key.sign" | "audit.log" | ...
+	//      "key.sign" | "audit.log" | "proc.exec" | ...
 	Cap string `json:"cap"`
 
-	// Target: path pattern, host pattern, "<app>.<method>", or sign-purpose.
+	// Target: path pattern, host pattern, "<app>.<method>", sign-purpose, or
+	// (for proc.exec) the single executable the app may spawn — an absolute path
+	// or a bare command name.
 	Target string `json:"target"`
 
 	// Condition is optional. If absent, the grant is unconditional.

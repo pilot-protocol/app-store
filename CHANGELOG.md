@@ -13,6 +13,26 @@ First release candidate. Surface is end-to-end working for the
 Production deployment against an untrusted publisher requires the
 catalog-signing chain landed in a follow-up RC (see "Known gaps").
 
+### Added — `proc.exec` capability
+
+- **New capability `proc.exec`.** An app may declare permission to spawn one
+  local executable — the CLI it fronts. This unblocks the app-store "CLI
+  adapter" archetype (translate `pilotctl appstore call <app> <args>` into a
+  local subprocess invocation).
+- **Hardened target.** The grant target must name exactly one binary: an
+  absolute path (`/usr/local/bin/tool`) or a bare command name (`gh`),
+  `[A-Za-z0-9._-]` segments only. A `*` wildcard, a path with `..`, spaces, or
+  any shell metacharacter is rejected at validation — a `proc.exec` grant can
+  never mean "run anything".
+- **Declaration-only, like `audit.log`.** The app execs the child itself, so
+  there is no per-call broker hook; the capability is the install-consented,
+  validated declaration of intent. CLI apps ship `protection: guarded`.
+- **Catalogue-only.** `proc.exec` is intentionally NOT added to the sideload
+  allow-list, so an unreviewed `--local` app can never carry it — CLI apps
+  install through the reviewed catalogue. OS-level exec sandboxing
+  (`sandbox-exec` / seccomp `execve` allow-list) remains the documented next
+  hardening step (`SideloadOSSandboxTODO`).
+
 ### Security & hardening — broker + supervisor
 
 - **Broker authorization (deny-by-default).** Every brokered call is
