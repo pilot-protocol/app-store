@@ -24,6 +24,32 @@ func newQuietLogger(t *testing.T) *log.Logger {
 	return log.New(io.Discard, "", 0)
 }
 
+// testPublisherSeed is a fixed Ed25519 seed so every helper-built
+// manifest is signed by the SAME publisher key. TestMain pins that key
+// into manifest.TrustedPublishers exactly once, before any test runs,
+// so the catalogue (non-sideloaded) trust-anchor check passes for
+// helper-built apps. Using a fixed key (set once, never mutated during
+// the run) keeps this race-free under `go test -race`, where supervisor
+// goroutines read TrustedPublishers concurrently.
+var testPublisherSeed = [ed25519.SeedSize]byte{
+	1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+	17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+}
+
+func testPublisherKey() (ed25519.PublicKey, ed25519.PrivateKey) {
+	priv := ed25519.NewKeyFromSeed(testPublisherSeed[:])
+	return priv.Public().(ed25519.PublicKey), priv
+}
+
+// TestMain pins the fixed test publisher as the sole trust anchor for
+// the whole package, then runs the suite. Set once, before any goroutine
+// reads it — no mutation during the run, so no data race.
+func TestMain(m *testing.M) {
+	pub, _ := testPublisherKey()
+	manifest.TrustedPublishers = []string{"ed25519:" + base64.StdEncoding.EncodeToString(pub)}
+	os.Exit(m.Run())
+}
+
 // parseDummyManifest returns a minimal *manifest.Manifest with the
 // given id. Used by tests that need a manifest struct without going
 // through the disk layout. The values are intentionally minimal — the
@@ -40,13 +66,70 @@ func parseDummyManifest(t *testing.T, id string) *manifest.Manifest {
 }
 
 // writeValidAppDir creates <root>/<id>/manifest.json with a manifest
-// that passes manifest.Parse + Validate + VerifySignature (so scanInstalled
-// accepts it). A fresh ed25519 keypair is generated per call so every
-// test app has a self-consistent signature. No binary is written — the
-// supervisor will hit verify-fail when it tries to spawn, but for tests
-// that only care about discovery / registration (rescan, Apps()) that's
-// the desired behavior.
+// that passes manifest.Parse + Validate + VerifySignature AND
+// VerifyTrustAnchor (so scanInstalled accepts it on the catalogue path).
+// It signs with the fixed test publisher key that TestMain pins into
+// manifest.TrustedPublishers. No binary is written — the supervisor
+// will hit verify-fail when it tries to spawn, but for tests that only
+// care about discovery / registration (rescan, Apps()) that's the
+// desired behavior.
 func writeValidAppDir(t *testing.T, root, id string) string {
+	t.Helper()
+	dir := filepath.Join(root, id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir %s: %v", dir, err)
+	}
+
+	pub, priv := testPublisherKey()
+	pubB64 := base64.StdEncoding.EncodeToString(pub)
+
+	template := strings.NewReplacer("ID", id, "PUBKEY", pubB64).Replace(`{
+		"id": "ID",
+		"manifest_version": 1,
+		"app_version": "0.0.0",
+		"protection": "shareable",
+		"binary": {"runtime": "go", "path": "bin/x", "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+		"exposes": ["ID.method"],
+		"grants": [
+			{"cap": "fs.read", "target": "$APP/data.db"}
+		],
+		"store": {
+			"publisher": "ed25519:PUBKEY",
+			"signature": ""
+		}
+	}`)
+
+	// Parse, sign, re-serialize.
+	m, err := manifest.Parse([]byte(template))
+	if err != nil {
+		t.Fatalf("parse template: %v", err)
+	}
+	// Compute the signing payload the same way manifest.VerifySignature expects.
+	grantsJSON, _ := json.Marshal(m.Grants)
+	grantsHash := sha256.Sum256(grantsJSON)
+	payload := fmt.Sprintf("%s:%s:%d:%s:%x",
+		m.Store.Publisher, m.ID, m.ManifestVersion, m.Binary.SHA256, grantsHash)
+	sig := ed25519.Sign(priv, []byte(payload))
+	m.Store.Signature = base64.StdEncoding.EncodeToString(sig)
+
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal signed manifest: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), raw, 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	return dir
+}
+
+// writeUntrustedSignedAppDir creates <root>/<id>/manifest.json with a
+// manifest that carries a VALID self-signature from a FRESH (untrusted)
+// publisher key — i.e. it passes VerifySignature but NOT VerifyTrustAnchor.
+// No `.sideloaded` marker is planted. This is the trust-boundary case:
+// a catalogue install must be refused unless the publisher is on the
+// trusted-publishers list, even when the signature itself is internally
+// consistent.
+func writeUntrustedSignedAppDir(t *testing.T, root, id string) string {
 	t.Helper()
 	dir := filepath.Join(root, id)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -75,12 +158,10 @@ func writeValidAppDir(t *testing.T, root, id string) string {
 		}
 	}`)
 
-	// Parse, sign, re-serialize.
 	m, err := manifest.Parse([]byte(template))
 	if err != nil {
 		t.Fatalf("parse template: %v", err)
 	}
-	// Compute the signing payload the same way manifest.VerifySignature expects.
 	grantsJSON, _ := json.Marshal(m.Grants)
 	grantsHash := sha256.Sum256(grantsJSON)
 	payload := fmt.Sprintf("%s:%s:%d:%s:%x",

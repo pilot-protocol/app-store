@@ -335,10 +335,20 @@ func (s *supervisor) scanInstalled() ([]*installedApp, error) {
 				continue
 			}
 		} else {
-			// Catalogue path: signature must verify against the
-			// publisher key embedded in the manifest.
+			// Catalogue path: a non-sideloaded install must satisfy the
+			// FULL trust chain, not just signature integrity.
+			// VerifySignature alone only proves the manifest was signed
+			// by whoever claims to be the publisher — a self-signed
+			// manifest from an UNTRUSTED key passes it. VerifyTrustAnchor
+			// then confirms that publisher key is on the trusted list.
+			// Both are required; sideloading (above) is the explicit,
+			// local opt-out of this chain.
 			if err := m.VerifySignature(); err != nil {
 				s.logger.Printf("skip %s: signature verification failed: %v", e.Name(), err)
+				continue
+			}
+			if err := m.VerifyTrustAnchor(); err != nil {
+				s.logger.Printf("skip %s: publisher not trusted: %v", e.Name(), err)
 				continue
 			}
 		}
