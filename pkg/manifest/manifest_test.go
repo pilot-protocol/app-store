@@ -390,48 +390,38 @@ func TestVerifySignatureRejectsEmptySignature(t *testing.T) {
 	}
 }
 
-func TestVerifyTrustAnchorEmptyListIsFailClosed(t *testing.T) {
-	// With TrustedPublishers empty (default), VerifyTrustAnchor must reject all publishers.
-	orig := TrustedPublishers
-	TrustedPublishers = nil
-	defer func() { TrustedPublishers = orig }()
-
+func TestVerifyTrustAnchorEmptyPinIsFailClosed(t *testing.T) {
+	// An app the catalogue does not pin (empty publisher) must be rejected,
+	// even if its own self-signature is valid.
 	m := mustValid(t)
-	if err := m.VerifyTrustAnchor(); err == nil {
-		t.Error("expected error with empty TrustedPublishers, got nil")
+	if err := m.VerifyTrustAnchor(""); err == nil {
+		t.Error("expected error with empty catalogue pin (app not pinned), got nil")
 	}
 }
 
-func TestVerifyTrustAnchorRejectsUntrustedPublisher(t *testing.T) {
-	trustedPub, _, err := ed25519.GenerateKey(rand.Reader)
+func TestVerifyTrustAnchorRejectsMismatchedPublisher(t *testing.T) {
+	cataloguePub, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	untrustedPub, _, err := ed25519.GenerateKey(rand.Reader)
+	otherPub, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	orig := TrustedPublishers
-	TrustedPublishers = []string{"ed25519:" + base64Enc(trustedPub)}
-	defer func() { TrustedPublishers = orig }()
 
 	m := mustValid(t)
-	m.Store.Publisher = "ed25519:" + base64Enc(untrustedPub)
-	if err := m.VerifyTrustAnchor(); err == nil {
-		t.Error("expected error for untrusted publisher, got nil")
+	m.Store.Publisher = "ed25519:" + base64Enc(otherPub)
+	// Catalogue pins cataloguePub but the manifest is published by otherPub.
+	if err := m.VerifyTrustAnchor("ed25519:" + base64Enc(cataloguePub)); err == nil {
+		t.Error("expected error: manifest publisher does not match the catalogue pin")
 	}
 }
 
-func TestVerifyTrustAnchorAcceptsTrustedPublisher(t *testing.T) {
+func TestVerifyTrustAnchorAcceptsCataloguePinnedPublisher(t *testing.T) {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	orig := TrustedPublishers
-	TrustedPublishers = []string{"ed25519:" + base64Enc(pub)}
-	defer func() { TrustedPublishers = orig }()
 
 	m := mustValid(t)
 	m.Store.Publisher = "ed25519:" + base64Enc(pub)
@@ -445,54 +435,29 @@ func TestVerifyTrustAnchorAcceptsTrustedPublisher(t *testing.T) {
 	if err := m.VerifySignature(); err != nil {
 		t.Fatalf("valid signature rejected: %v", err)
 	}
-	// VerifyTrustAnchor must pass because the publisher IS trusted.
-	if err := m.VerifyTrustAnchor(); err != nil {
-		t.Errorf("trusted publisher rejected by VerifyTrustAnchor: %v", err)
-	}
-}
-
-func TestVerifyTrustAnchorMultipleTrustedKeys(t *testing.T) {
-	pub1, _, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pub2, priv2, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	orig := TrustedPublishers
-	TrustedPublishers = []string{
-		"ed25519:" + base64Enc(pub1),
-		"ed25519:" + base64Enc(pub2),
-	}
-	defer func() { TrustedPublishers = orig }()
-
-	m := mustValid(t)
-	m.Store.Publisher = "ed25519:" + base64Enc(pub2)
-	sig, err := signTestManifest(m, priv2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	m.Store.Signature = sig
-
-	if err := m.VerifySignature(); err != nil {
-		t.Fatalf("valid signature rejected: %v", err)
-	}
-	if err := m.VerifyTrustAnchor(); err != nil {
-		t.Errorf("second trusted publisher rejected: %v", err)
+	// VerifyTrustAnchor must pass: the manifest publisher equals the catalogue pin.
+	if err := m.VerifyTrustAnchor("ed25519:" + base64Enc(pub)); err != nil {
+		t.Errorf("catalogue-pinned publisher rejected by VerifyTrustAnchor: %v", err)
 	}
 }
 
 func TestVerifyTrustAnchorRejectsBadPublisherFormat(t *testing.T) {
-	orig := TrustedPublishers
-	TrustedPublishers = []string{"ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}
-	defer func() { TrustedPublishers = orig }()
-
 	m := mustValid(t)
 	m.Store.Publisher = "not-valid-publisher"
-	if err := m.VerifyTrustAnchor(); err == nil {
+	if err := m.VerifyTrustAnchor("ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="); err == nil {
 		t.Error("expected error with bad publisher format, got nil")
+	}
+}
+
+func TestVerifyTrustAnchorRejectsBadCataloguePinFormat(t *testing.T) {
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := mustValid(t)
+	m.Store.Publisher = "ed25519:" + base64Enc(pub)
+	if err := m.VerifyTrustAnchor("not-a-valid-key"); err == nil {
+		t.Error("expected error with malformed catalogue pin, got nil")
 	}
 }
 

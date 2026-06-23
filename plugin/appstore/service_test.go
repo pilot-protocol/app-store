@@ -20,8 +20,9 @@ func TestStartWarnsOnPlaceholderCatalogPubkey(t *testing.T) {
 	t.Run("placeholder (all-zeros) → warns", func(t *testing.T) {
 		var buf strings.Builder
 		s := NewService(Config{
-			InstallRoot: t.TempDir(),
-			Logger:      log.New(&buf, "", 0),
+			CataloguePublisher: testCatPub,
+			InstallRoot:        t.TempDir(),
+			Logger:             log.New(&buf, "", 0),
 		})
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -38,9 +39,10 @@ func TestStartWarnsOnPlaceholderCatalogPubkey(t *testing.T) {
 		realKey := make([]byte, 32)
 		realKey[0] = 0x01 // any non-zero byte qualifies
 		s := NewService(Config{
-			InstallRoot:   t.TempDir(),
-			CatalogPubkey: realKey,
-			Logger:        log.New(&buf, "", 0),
+			CataloguePublisher: testCatPub,
+			InstallRoot:        t.TempDir(),
+			CatalogPubkey:      realKey,
+			Logger:             log.New(&buf, "", 0),
 		})
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -72,7 +74,7 @@ func TestNewServiceDefaults(t *testing.T) {
 
 func TestStartStopEmptyInstallRoot(t *testing.T) {
 	dir := t.TempDir()
-	s := NewService(Config{InstallRoot: dir})
+	s := NewService(Config{InstallRoot: dir, CataloguePublisher: testCatPub})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -87,7 +89,7 @@ func TestStartStopEmptyInstallRoot(t *testing.T) {
 
 func TestStartCreatesInstallRoot(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "nested", "apps")
-	s := NewService(Config{InstallRoot: dir})
+	s := NewService(Config{InstallRoot: dir, CataloguePublisher: testCatPub})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -111,8 +113,9 @@ func TestRescanDiscoversAppInstalledMidRun(t *testing.T) {
 	writeValidAppDir(t, root, "io.app1")
 
 	svc := NewService(Config{
-		InstallRoot:    root,
-		RescanInterval: 30 * time.Millisecond, // fast for tests
+		CataloguePublisher: testCatPub,
+		InstallRoot:        root,
+		RescanInterval:     30 * time.Millisecond, // fast for tests
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -152,8 +155,9 @@ func TestRescanDetectsUninstall(t *testing.T) {
 	writeValidAppDir(t, root, "io.app2")
 
 	svc := NewService(Config{
-		InstallRoot:    root,
-		RescanInterval: 30 * time.Millisecond,
+		CataloguePublisher: testCatPub,
+		InstallRoot:        root,
+		RescanInterval:     30 * time.Millisecond,
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -195,7 +199,7 @@ func TestRescanResumeClearsSuspendedMarker(t *testing.T) {
 	root := t.TempDir()
 	appDir := writeValidAppDir(t, root, "io.suspended.app")
 
-	sup := newSupervisor(Config{InstallRoot: root}, Deps{}, newQuietLogger(t))
+	sup := newSupervisor(Config{InstallRoot: root, CataloguePublisher: testCatPub}, Deps{}, newQuietLogger(t))
 	sup.mu.Lock()
 	sup.installed["io.suspended.app"] = &installedApp{
 		Dir:        appDir,
@@ -241,8 +245,9 @@ func TestRescanResumesAppOnMarker(t *testing.T) {
 	// exceeding the crash-loop cap; we don't need the live goroutine
 	// for the resume signal to be testable).
 	sup := newSupervisor(Config{
-		InstallRoot:    root,
-		RescanInterval: 20 * time.Millisecond,
+		CataloguePublisher: testCatPub,
+		InstallRoot:        root,
+		RescanInterval:     20 * time.Millisecond,
 	}, Deps{}, newQuietLogger(t))
 	sup.mu.Lock()
 	sup.installed["io.suspended.app"] = &installedApp{
@@ -285,7 +290,7 @@ func TestScanIgnoresInvalidManifest(t *testing.T) {
 	empty := filepath.Join(root, "io.empty.app")
 	_ = os.MkdirAll(empty, 0o755)
 
-	sup := newSupervisor(Config{InstallRoot: root}, Deps{}, newQuietLogger(t))
+	sup := newSupervisor(Config{InstallRoot: root, CataloguePublisher: testCatPub}, Deps{}, newQuietLogger(t))
 	apps, err := sup.scanInstalled()
 	if err != nil {
 		t.Fatalf("scan: %v", err)
