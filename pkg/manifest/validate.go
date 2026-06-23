@@ -19,7 +19,21 @@ var KnownCaps = map[string]bool{
 	"ipc.call":  true,
 	"key.sign":  true,
 	"audit.log": true,
+	// proc.exec: the app may spawn a local subprocess (the CLI it fronts). The
+	// target names the single executable it may run — an absolute path or a bare
+	// command name, never a wildcard or a shell string. Like audit.log this is a
+	// declared, install-consented capability the app enforces itself (it execs
+	// the child directly), not a per-call brokered one. See procExecTargetPattern.
+	"proc.exec": true,
 }
+
+// procExecTargetPattern constrains a proc.exec target to a single executable:
+// either an absolute path (/usr/local/bin/tool) or a bare command name resolved
+// via PATH (gh, python3, my-tool). Segments are limited to [A-Za-z0-9._-], so
+// spaces, shell metacharacters, and a "*" wildcard are all rejected — a
+// proc.exec grant must name exactly one binary, never "run anything". A ".."
+// path segment is rejected separately (see validateProcExecTarget).
+var procExecTargetPattern = regexp.MustCompile(`^/?[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$`)
 
 // Known condition kinds.
 var KnownConditionKinds = map[string]bool{
@@ -192,11 +206,28 @@ func validateGrant(i int, g Grant) []error {
 	}
 	if strings.TrimSpace(g.Target) == "" {
 		errs = append(errs, fmt.Errorf("grants[%d].target must not be empty", i))
+	} else if g.Cap == "proc.exec" {
+		errs = append(errs, validateProcExecTarget(i, g.Target)...)
 	}
 	if g.Condition != nil {
 		errs = append(errs, validateCondition(fmt.Sprintf("grants[%d].if", i), *g.Condition)...)
 	}
 	return errs
+}
+
+// validateProcExecTarget enforces the proc.exec target shape: a single
+// executable named as an absolute path or a bare command, with no path
+// traversal, no shell, and no wildcard. This keeps the install-consented
+// surface explicit ("this app may run: <exactly one binary>").
+func validateProcExecTarget(i int, target string) []error {
+	t := strings.TrimSpace(target)
+	if strings.Contains(t, "..") {
+		return []error{fmt.Errorf("grants[%d].target %q for proc.exec must not contain %q", i, target, "..")}
+	}
+	if !procExecTargetPattern.MatchString(t) {
+		return []error{fmt.Errorf("grants[%d].target %q for proc.exec must be an absolute path or a bare command name (no wildcard, spaces, or shell metacharacters)", i, target)}
+	}
+	return nil
 }
 
 func validateCondition(path string, c Condition) []error {
