@@ -36,6 +36,18 @@ type Config struct {
 	// dev key via NewServiceWithKey.
 	CatalogPubkey []byte
 
+	// CataloguePublisher returns the publisher key ("ed25519:<base64>") that the
+	// release-signed catalogue pins for appID, and whether appID is pinned at
+	// all. It is the trust anchor for non-sideloaded apps: before spawning a
+	// catalogue app the supervisor confirms the installed manifest's publisher
+	// matches this pin (manifest.VerifyTrustAnchor). The daemon supplies it from
+	// the catalogue it has signature-verified with CatalogPubkey.
+	//
+	// When nil (or it reports an app as not pinned), non-sideloaded apps
+	// fail closed — they are not spawned. Sideloaded apps bypass this and are
+	// clamped to the safe grant subset instead.
+	CataloguePublisher func(appID string) (publisher string, pinned bool)
+
 	// Logger optionally redirects internal messages. When nil the
 	// service logs via the standard log package.
 	Logger *log.Logger
@@ -135,13 +147,13 @@ func (s *Service) Order() int { return 120 }
 // Go's structural typing makes this work as long as the methods used here
 // are present on the real types.
 type Deps struct {
-	Streams    any // coreapi.Streams — Dial, Listen, SendDatagram
-	Identity   any // coreapi.Identity — NodeID, Address, PublicKey, Sign
-	Resolver   any
-	Events     any // coreapi.EventBus — Publish, Subscribe
-	Logger     any
-	Trust      any
-	Telemetry  TelemetryEmitter // optional; no-op when nil
+	Streams   any // coreapi.Streams — Dial, Listen, SendDatagram
+	Identity  any // coreapi.Identity — NodeID, Address, PublicKey, Sign
+	Resolver  any
+	Events    any // coreapi.EventBus — Publish, Subscribe
+	Logger    any
+	Trust     any
+	Telemetry TelemetryEmitter // optional; no-op when nil
 }
 
 // Start scans InstallRoot for installed apps, verifies each binary's

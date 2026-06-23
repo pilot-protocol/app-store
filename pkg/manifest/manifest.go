@@ -196,49 +196,52 @@ func (m *Manifest) signingPayload() ([]byte, error) {
 	return []byte(payload), nil
 }
 
-// TrustedPublishers is the compile-time-embedded list of publisher
-// ed25519 public keys ("ed25519:<base64>" or raw base64) that are
-// trusted to sign manifests. Empty list = fail-closed (no publisher
-// passes the trust-anchor check). Production builds MUST populate
-// this list with the known-good publisher keys.
-var TrustedPublishers []string
-
-// VerifyTrustAnchor checks that Store.Publisher is on the trusted
-// publishers list. Without this check, VerifySignature only confirms
-// the manifest was signed by whoever claims to be the publisher;
-// VerifyTrustAnchor confirms the publisher itself is known and trusted.
-//
-// Returns nil if Store.Publisher is in TrustedPublishers.
-// Returns an error if TrustedPublishers is empty (fail-closed) or if
-// the publisher is not found.
-func (m *Manifest) VerifyTrustAnchor() error {
-	if len(TrustedPublishers) == 0 {
-		return fmt.Errorf("trust anchor: TrustedPublishers is empty — no publisher is trusted")
-	}
-
-	pubkeyRaw, ok := strings.CutPrefix(m.Store.Publisher, "ed25519:")
-	if !ok {
-		return fmt.Errorf("store.publisher must be \"ed25519:<base64>\"")
-	}
-	pubkey, err := base64.StdEncoding.DecodeString(pubkeyRaw)
+// decodeEd25519Pub parses an "ed25519:<base64>" (or bare base64) public key
+// into raw bytes, validating the length.
+func decodeEd25519Pub(s string) ([]byte, error) {
+	raw := strings.TrimPrefix(strings.TrimSpace(s), "ed25519:")
+	key, err := base64.StdEncoding.DecodeString(raw)
 	if err != nil {
-		return fmt.Errorf("store.publisher: invalid base64: %w", err)
+		return nil, fmt.Errorf("invalid base64: %w", err)
 	}
-	if len(pubkey) != ed25519.PublicKeySize {
-		return fmt.Errorf("store.publisher: wrong key length %d, want %d", len(pubkey), ed25519.PublicKeySize)
+	if len(key) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("wrong key length %d, want %d", len(key), ed25519.PublicKeySize)
 	}
+	return key, nil
+}
 
-	for _, trusted := range TrustedPublishers {
-		trustedRaw := strings.TrimPrefix(trusted, "ed25519:")
-		trustedKey, err := base64.StdEncoding.DecodeString(trustedRaw)
-		if err != nil {
-			continue // skip malformed entries
-		}
-		if bytes.Equal(pubkey, trustedKey) {
-			return nil
-		}
+// VerifyTrustAnchor confirms that Store.Publisher matches the publisher key the
+// release-signed catalogue pins for this app. This is the trust anchor for
+// non-sideloaded (catalogue) installs: the catalogue is the root of trust
+// (the installer verifies the catalogue signature and pins each app's bundle
+// sha256), and this check re-confirms on every launch that the installed
+// manifest is published by the catalogue-declared key.
+//
+// Without it, VerifySignature alone only proves a manifest is internally
+// self-consistent — a manifest self-signed by ANY key would pass — which would
+// let an app dropped into the install root run with full grants.
+//
+// cataloguePublisher is the "ed25519:<base64>" key the verified catalogue
+// declares for m.ID; the caller (the supervisor) obtains it from the
+// signature-verified catalogue via Config.CataloguePublisher. An empty string
+// means the app is not pinned by the catalogue, which is fail-closed. Returns
+// nil only when the manifest's publisher equals the catalogue-pinned key.
+func (m *Manifest) VerifyTrustAnchor(cataloguePublisher string) error {
+	if strings.TrimSpace(cataloguePublisher) == "" {
+		return fmt.Errorf("trust anchor: %s is not pinned by the signed catalogue", m.ID)
 	}
-	return fmt.Errorf("trust anchor: publisher %s is not on the trusted-publishers list", m.Store.Publisher)
+	pubkey, err := decodeEd25519Pub(m.Store.Publisher)
+	if err != nil {
+		return fmt.Errorf("store.publisher: %w", err)
+	}
+	trustedKey, err := decodeEd25519Pub(cataloguePublisher)
+	if err != nil {
+		return fmt.Errorf("catalogue publisher for %s: %w", m.ID, err)
+	}
+	if !bytes.Equal(pubkey, trustedKey) {
+		return fmt.Errorf("trust anchor: publisher %s does not match the catalogue pin for %s", m.Store.Publisher, m.ID)
+	}
+	return nil
 }
 
 // VerifySignature checks that Store.Signature is a valid ed25519
@@ -248,9 +251,9 @@ func (m *Manifest) VerifyTrustAnchor() error {
 // (Publisher, ID, ManifestVersion, Binary.SHA256, Grants) will cause
 // verification to fail.
 //
-// IMPORTANT: This does NOT check that Store.Publisher is a trusted key.
-// Callers MUST also call VerifyTrustAnchor() after VerifySignature()
-// to confirm the publisher is on the TrustedPublishers list.
+// IMPORTANT: This does NOT check that Store.Publisher is trusted. For
+// non-sideloaded apps, callers MUST also call VerifyTrustAnchor(cataloguePublisher)
+// to confirm the publisher matches the key the signed catalogue pins for the app.
 func (m *Manifest) VerifySignature() error {
 	pubkeyRaw, ok := strings.CutPrefix(m.Store.Publisher, "ed25519:")
 	if !ok {

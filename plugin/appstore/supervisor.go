@@ -58,14 +58,14 @@ const maxAuditLogSize = 10 * 1024 * 1024
 // auditEvent is one line in the supervisor.log JSONL stream.
 // AppID + EventType + At are always populated; the rest depends on type.
 type auditEvent struct {
-	At        time.Time `json:"at"`
-	AppID     string    `json:"app"`
-	Event     string    `json:"event"` // "spawn", "exit", "suspend", "verify-fail"
-	PID       int       `json:"pid,omitempty"`
-	ExitCode  int       `json:"exit_code,omitempty"`
-	Reason    string    `json:"reason,omitempty"`
-	SHA256    string    `json:"sha256,omitempty"`     // pinned hash, recorded on spawn for traceability
-	BinaryAt  string    `json:"binary_path,omitempty"`
+	At       time.Time `json:"at"`
+	AppID    string    `json:"app"`
+	Event    string    `json:"event"` // "spawn", "exit", "suspend", "verify-fail"
+	PID      int       `json:"pid,omitempty"`
+	ExitCode int       `json:"exit_code,omitempty"`
+	Reason   string    `json:"reason,omitempty"`
+	SHA256   string    `json:"sha256,omitempty"` // pinned hash, recorded on spawn for traceability
+	BinaryAt string    `json:"binary_path,omitempty"`
 }
 
 // writeAuditLine appends one JSON-encoded event to the app's
@@ -164,9 +164,9 @@ type supervisor struct {
 
 	// mu guards installed + ready + crashes + appCancel.
 	mu        sync.RWMutex
-	installed map[string]*installedApp    // app_id → record
-	ready     map[string]bool             // app_id → socket has appeared at least once
-	crashes   map[string]*crashRecord     // app_id → sliding-window crash counter
+	installed map[string]*installedApp      // app_id → record
+	ready     map[string]bool               // app_id → socket has appeared at least once
+	crashes   map[string]*crashRecord       // app_id → sliding-window crash counter
 	appCancel map[string]context.CancelFunc // app_id → cancel its per-app context (used to stop a supervise goroutine on detected uninstall)
 }
 
@@ -337,17 +337,21 @@ func (s *supervisor) scanInstalled() ([]*installedApp, error) {
 		} else {
 			// Catalogue path: a non-sideloaded install must satisfy the
 			// FULL trust chain, not just signature integrity.
-			// VerifySignature alone only proves the manifest was signed
-			// by whoever claims to be the publisher — a self-signed
-			// manifest from an UNTRUSTED key passes it. VerifyTrustAnchor
-			// then confirms that publisher key is on the trusted list.
-			// Both are required; sideloading (above) is the explicit,
-			// local opt-out of this chain.
+			// VerifySignature alone only proves the manifest was signed by
+			// whoever claims to be the publisher — a self-signed manifest from
+			// ANY key passes it. VerifyTrustAnchor then anchors that publisher
+			// to the release-signed catalogue: it must equal the publisher key
+			// the catalogue pins for this app id. Both are required; sideloading
+			// (above) is the explicit, local opt-out of this chain.
 			if err := m.VerifySignature(); err != nil {
 				s.logger.Printf("skip %s: signature verification failed: %v", e.Name(), err)
 				continue
 			}
-			if err := m.VerifyTrustAnchor(); err != nil {
+			var cataloguePub string
+			if s.cfg.CataloguePublisher != nil {
+				cataloguePub, _ = s.cfg.CataloguePublisher(m.ID)
+			}
+			if err := m.VerifyTrustAnchor(cataloguePub); err != nil {
 				s.logger.Printf("skip %s: publisher not trusted: %v", e.Name(), err)
 				continue
 			}

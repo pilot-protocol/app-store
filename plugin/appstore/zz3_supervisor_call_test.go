@@ -79,7 +79,7 @@ func TestSupervisor_Call_HappyPath(t *testing.T) {
 
 	mh := parseDummyManifest(t, "io.call.happy")
 	mh.Exposes = []string{"echo"}
-	sup := newSupervisor(Config{InstallRoot: dir}, Deps{}, newQuietLogger(t))
+	sup := newSupervisor(Config{InstallRoot: dir, CataloguePublisher: testCatPub}, Deps{}, newQuietLogger(t))
 	sup.mu.Lock()
 	sup.installed["io.call.happy"] = &installedApp{
 		Dir:        appDir,
@@ -118,7 +118,7 @@ func TestSupervisor_Call_PropagatesServerError(t *testing.T) {
 
 	me := parseDummyManifest(t, "io.call.err")
 	me.Exposes = []string{"boom"}
-	sup := newSupervisor(Config{InstallRoot: dir}, Deps{}, newQuietLogger(t))
+	sup := newSupervisor(Config{InstallRoot: dir, CataloguePublisher: testCatPub}, Deps{}, newQuietLogger(t))
 	sup.mu.Lock()
 	sup.installed["io.call.err"] = &installedApp{
 		Dir:        appDir,
@@ -146,8 +146,9 @@ func TestRescanForResume_IntegrationViaRunLoop(t *testing.T) {
 	appDir := writeValidAppDir(t, root, "io.resume.run")
 
 	svc := NewService(Config{
-		InstallRoot:    root,
-		RescanInterval: 30 * time.Millisecond,
+		CataloguePublisher: testCatPub,
+		InstallRoot:        root,
+		RescanInterval:     30 * time.Millisecond,
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -188,7 +189,7 @@ func TestRescanForResume_IntegrationViaRunLoop(t *testing.T) {
 func TestRotateAuditIfLarge_NoActiveLogIsNoOp(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	sup := newSupervisor(Config{InstallRoot: dir, AuditLogMaxBytes: 1}, Deps{}, newQuietLogger(t))
+	sup := newSupervisor(Config{InstallRoot: dir, AuditLogMaxBytes: 1, CataloguePublisher: testCatPub}, Deps{}, newQuietLogger(t))
 	// Should not panic or create anything.
 	sup.rotateAuditIfLarge(dir)
 	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
@@ -214,7 +215,7 @@ func TestWriteAuditLine_OpenFailure(t *testing.T) {
 	}
 	defer os.Chmod(appDir, 0o700) //nolint:errcheck // best-effort teardown
 	app := &installedApp{Dir: appDir, Manifest: parseDummyManifest(t, "io.audit.locked")}
-	sup := newSupervisor(Config{InstallRoot: dir}, Deps{}, newQuietLogger(t))
+	sup := newSupervisor(Config{InstallRoot: dir, CataloguePublisher: testCatPub}, Deps{}, newQuietLogger(t))
 	// Must not panic — the supervisor logs the open error and returns.
 	sup.writeAuditLine(app, auditEvent{Event: "spawn", PID: 1})
 }
@@ -241,7 +242,7 @@ func TestSuperviseOne_VerifyFailRetriesPastBackoff(t *testing.T) {
 		IDPath:     filepath.Join(appDir, "identity.json"),
 		Manifest:   parseDummyManifest(t, "io.supervise.retry"),
 	}
-	sup := newSupervisor(Config{InstallRoot: dir}, Deps{}, newQuietLogger(t))
+	sup := newSupervisor(Config{InstallRoot: dir, CataloguePublisher: testCatPub}, Deps{}, newQuietLogger(t))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()

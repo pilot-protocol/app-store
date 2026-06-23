@@ -29,8 +29,8 @@ func TestCompareVersions(t *testing.T) {
 		{"1.0.0", "1.0.1", -1},
 		{"0.0.1", "0.0.0", 1},
 		{"9.99.9", "10.0.0", -1},
-		{"1.0.0-alpha", "1.0.0", -1},  // prerelease < release
-		{"1.0.0", "1.0.0-alpha", 1},    // release > prerelease
+		{"1.0.0-alpha", "1.0.0", -1}, // prerelease < release
+		{"1.0.0", "1.0.0-alpha", 1},  // release > prerelease
 		{"1.0.0-alpha", "1.0.0-beta", -1},
 		{"1.0.0-beta", "1.0.0-alpha", 1},
 	}
@@ -51,7 +51,7 @@ func TestRegisterRefusesDowngrade(t *testing.T) {
 	root := t.TempDir()
 	appDir := writeValidAppDir(t, root, "io.test.app")
 
-	sup := newSupervisor(Config{InstallRoot: root}, Deps{}, newQuietLogger(t))
+	sup := newSupervisor(Config{InstallRoot: root, CataloguePublisher: testCatPub}, Deps{}, newQuietLogger(t))
 
 	// Register the current (newer) version first.
 	current := &installedApp{
@@ -89,7 +89,7 @@ func TestRegisterAllowsUpgrade(t *testing.T) {
 	root := t.TempDir()
 	appDir := writeValidAppDir(t, root, "io.test.app")
 
-	sup := newSupervisor(Config{InstallRoot: root}, Deps{}, newQuietLogger(t))
+	sup := newSupervisor(Config{InstallRoot: root, CataloguePublisher: testCatPub}, Deps{}, newQuietLogger(t))
 
 	old := &installedApp{
 		Dir:        appDir,
@@ -118,7 +118,7 @@ func TestRegisterSameVersionIsIdempotent(t *testing.T) {
 	root := t.TempDir()
 	appDir := writeValidAppDir(t, root, "io.test.app")
 
-	sup := newSupervisor(Config{InstallRoot: root}, Deps{}, newQuietLogger(t))
+	sup := newSupervisor(Config{InstallRoot: root, CataloguePublisher: testCatPub}, Deps{}, newQuietLogger(t))
 
 	a1 := &installedApp{
 		Dir:        appDir,
@@ -194,8 +194,9 @@ func TestRescanRefusesDowngradeMidRun(t *testing.T) {
 	appDir := writeAppDirWithVersion(t, root, "io.test.app", "2.0.0")
 
 	sup := newSupervisor(Config{
-		InstallRoot:    root,
-		RescanInterval: 20 * 1e6, // not used directly in this test
+		CataloguePublisher: testCatPub,
+		InstallRoot:        root,
+		RescanInterval:     20 * 1e6, // not used directly in this test
 	}, Deps{}, newQuietLogger(t))
 
 	// Register the app in-memory as if already discovered at startup.
@@ -231,8 +232,9 @@ func TestRescanAllowsUpgradeMidRun(t *testing.T) {
 	appDir := writeAppDirWithVersion(t, root, "io.test.app", "1.0.0")
 
 	sup := newSupervisor(Config{
-		InstallRoot:    root,
-		RescanInterval: 20 * 1e6,
+		CataloguePublisher: testCatPub,
+		InstallRoot:        root,
+		RescanInterval:     20 * 1e6,
 	}, Deps{}, newQuietLogger(t))
 
 	entry := &installedApp{
@@ -267,8 +269,9 @@ func TestRescanAuditLogsUpgradeApplied(t *testing.T) {
 	appDir := writeAppDirWithVersion(t, root, "io.test.app", "1.0.0")
 
 	sup := newSupervisor(Config{
-		InstallRoot:    root,
-		RescanInterval: 20 * 1e6,
+		CataloguePublisher: testCatPub,
+		InstallRoot:        root,
+		RescanInterval:     20 * 1e6,
 	}, Deps{}, newQuietLogger(t))
 
 	entry := &installedApp{
@@ -306,8 +309,9 @@ func TestRescanAuditLogsDowngradeRefusal(t *testing.T) {
 	appDir := writeAppDirWithVersion(t, root, "io.test.app", "2.0.0")
 
 	sup := newSupervisor(Config{
-		InstallRoot:    root,
-		RescanInterval: 20 * 1e6,
+		CataloguePublisher: testCatPub,
+		InstallRoot:        root,
+		RescanInterval:     20 * 1e6,
 	}, Deps{}, newQuietLogger(t))
 
 	entry := &installedApp{
