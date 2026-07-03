@@ -25,6 +25,10 @@ var KnownCaps = map[string]bool{
 	// declared, install-consented capability the app enforces itself (it execs
 	// the child directly), not a per-call brokered one. See procExecTargetPattern.
 	"proc.exec": true,
+	// identity.verify: declarative cap for apps that call the daemon's
+	// envelope-verification IPC (CmdVerifyEnvelope) to check a remote
+	// peer's signed envelope out-of-band. See pkg/appkit.
+	"identity.verify": true,
 }
 
 // procExecTargetPattern constrains a proc.exec target to a single executable:

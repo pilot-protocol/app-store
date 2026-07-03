@@ -207,6 +207,18 @@ func TestValidate_GrantEmptyTarget(t *testing.T) {
 	}
 }
 
+// TestValidate_IdentityVerifyCapKnown confirms identity.verify is in the
+// capability vocabulary — apps calling the daemon's envelope-verification
+// IPC declare it, and manifests carrying it must validate.
+func TestValidate_IdentityVerifyCapKnown(t *testing.T) {
+	t.Parallel()
+	m := mustValid(t)
+	m.Grants = append(m.Grants, Grant{Cap: "identity.verify", Target: "*"})
+	if errs := m.Validate(); len(errs) != 0 {
+		t.Errorf("identity.verify grant should validate, got: %v", errs)
+	}
+}
+
 // TestMarshal_PreservesStructuralFields confirms a roundtrip produces
 // valid JSON containing the input fields. Doubles as smoke for
 // Marshal().
