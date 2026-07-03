@@ -19,6 +19,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/pilot-protocol/app-store/pkg/ipc"
 )
 
 // Config carries the integration-time settings. Passed by the daemon's
@@ -278,4 +280,23 @@ func (s *Service) CallFrom(ctx context.Context, callerID, appID, method string, 
 		return errors.New("appstore: service not started")
 	}
 	return sup.CallFrom(ctx, callerID, appID, method, args, out)
+}
+
+// CallWithOrigin is the trusted daemon-bridge entry point: Call with a
+// daemon-attested ipc.Origin stamped on the request envelope, so the app's
+// handler can see which remote Pilot node the request originated from and
+// whether that identity was proven during the key exchange. Empty-callerID
+// semantics apply (no cross-app grant gate).
+//
+// Only the daemon should call this — origin is exactly as trustworthy as
+// the caller. Cross-app calls (CallFrom) always deliver a nil origin, so
+// apps cannot forge one through the broker.
+func (s *Service) CallWithOrigin(ctx context.Context, appID, method string, args, out any, origin *ipc.Origin) error {
+	s.startMu.Lock()
+	sup := s.sup
+	s.startMu.Unlock()
+	if sup == nil {
+		return errors.New("appstore: service not started")
+	}
+	return sup.CallWithOrigin(ctx, appID, method, args, out, origin)
 }

@@ -26,6 +26,15 @@ func (e *ErrServerError) Error() string { return "ipc: server error: " + e.Msg }
 // Returns *ErrServerError on EnvErr replies, a wrapped framing error on
 // transport failures, or nil on success.
 func Call(conn io.ReadWriter, method string, args, result any) error {
+	return CallWithOrigin(conn, method, args, result, nil)
+}
+
+// CallWithOrigin is Call with a daemon-attested Origin stamped on the
+// request envelope. Only the trusted bridge path (the daemon / broker
+// acting on behalf of a remote peer) should pass a non-nil origin —
+// see the Origin doc for the trust model. A nil origin behaves exactly
+// like Call.
+func CallWithOrigin(conn io.ReadWriter, method string, args, result any, origin *Origin) error {
 	reqID, err := randReqID()
 	if err != nil {
 		return fmt.Errorf("ipc call: req_id: %w", err)
@@ -42,6 +51,7 @@ func Call(conn io.ReadWriter, method string, args, result any) error {
 		Type:    EnvReq,
 		ReqID:   reqID,
 		Method:  method,
+		Origin:  origin,
 		Payload: payload,
 	}
 	if err := WriteFrame(conn, req); err != nil {

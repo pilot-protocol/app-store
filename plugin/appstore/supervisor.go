@@ -1031,7 +1031,17 @@ func (s *supervisor) Get(appID string) *installedApp {
 // CallFrom with an empty callerID — the broker-surface (exposes) gate
 // still applies, but no cross-app ipc.call grant is required.
 func (s *supervisor) Call(ctx context.Context, appID, method string, args, out any) error {
-	return s.callFrom(ctx, "", appID, method, args, out)
+	return s.callFrom(ctx, "", appID, method, args, out, nil)
+}
+
+// CallWithOrigin is Call with a daemon-attested Origin stamped on the
+// request envelope delivered to the app. It is the trusted bridge path:
+// the daemon proved the remote peer's identity during the authenticated
+// key exchange and vouches for it here. Empty-callerID semantics apply
+// (no cross-app grant gate). Apps never reach this path — cross-app
+// calls go through CallFrom, which always strips origin.
+func (s *supervisor) CallWithOrigin(ctx context.Context, appID, method string, args, out any, origin *ipc.Origin) error {
+	return s.callFrom(ctx, "", appID, method, args, out, origin)
 }
 
 // CallFrom dispatches method+args into the named installed app on behalf
@@ -1046,7 +1056,7 @@ func (s *supervisor) Call(ctx context.Context, appID, method string, args, out a
 //  3. cross-app only: caller must be installed and hold an `ipc.call`
 //     grant matching "<app>.<method>"          → ErrGrantMissing
 func (s *supervisor) CallFrom(ctx context.Context, callerID, appID, method string, args, out any) error {
-	return s.callFrom(ctx, callerID, appID, method, args, out)
+	return s.callFrom(ctx, callerID, appID, method, args, out, nil)
 }
 
 // callFrom is the shared implementation behind Call and CallFrom. The
@@ -1056,7 +1066,15 @@ func (s *supervisor) CallFrom(ctx context.Context, callerID, appID, method strin
 //
 // After every call (success or failure) a telemetry usage event is
 // emitted — best-effort, never blocks the caller.
-func (s *supervisor) callFrom(ctx context.Context, callerID, appID, method string, args, out any) error {
+//
+// origin is the daemon-attested remote-node identity to stamp on the
+// request envelope — non-nil only on the CallWithOrigin path. Anti-forgery:
+// a cross-app call (non-empty callerID) NEVER carries an origin, so an app
+// cannot launder a forged origin through the broker to another app.
+func (s *supervisor) callFrom(ctx context.Context, callerID, appID, method string, args, out any, origin *ipc.Origin) error {
+	if callerID != "" {
+		origin = nil
+	}
 	s.mu.RLock()
 	app, ok := s.installed[appID]
 	caller, callerOK := s.installed[callerID]
@@ -1115,7 +1133,7 @@ func (s *supervisor) callFrom(ctx context.Context, callerID, appID, method strin
 	}
 
 	start := time.Now()
-	err = ipc.Call(conn, method, args, out)
+	err = ipc.CallWithOrigin(conn, method, args, out, origin)
 	dur := time.Since(start).Milliseconds()
 	if err != nil {
 		s.emitUsage(callerID, appID, method, false, dur, err.Error())
