@@ -168,6 +168,12 @@ type supervisor struct {
 	ready     map[string]bool               // app_id → socket has appeared at least once
 	crashes   map[string]*crashRecord       // app_id → sliding-window crash counter
 	appCancel map[string]context.CancelFunc // app_id → cancel its per-app context (used to stop a supervise goroutine on detected uninstall)
+
+	// sigMu guards sigFails. Kept separate from mu because the
+	// signature-failure bookkeeping happens inside scanInstalled, which
+	// must not hold the main lock while walking the filesystem.
+	sigMu    sync.Mutex
+	sigFails map[string]*sigFailRecord // install-dir name → manifest-signature failure state
 }
 
 func newSupervisor(cfg Config, deps Deps, logger *log.Logger) *supervisor {
@@ -183,6 +189,7 @@ func newSupervisor(cfg Config, deps Deps, logger *log.Logger) *supervisor {
 		ready:     map[string]bool{},
 		crashes:   map[string]*crashRecord{},
 		appCancel: map[string]context.CancelFunc{},
+		sigFails:  map[string]*sigFailRecord{},
 	}
 }
 
@@ -288,6 +295,109 @@ type installedApp struct {
 	Sideloaded bool
 }
 
+// Signature-failure backoff/quarantine bounds. A manifest whose ed25519
+// signature does not verify is skipped by scanInstalled, so it is never
+// added to the installed map and gets re-examined on EVERY rescan tick.
+// Without throttling that produced hundreds of thousands of identical
+// "signature verification failed" log lines (the ~2s hot loop this fix
+// addresses). These bounds dedup the log per (dir, manifest-hash), back
+// off between re-verifications, and quarantine a persistently-bad app.
+const (
+	// sigBackoffStart is the first re-verify delay after a signature
+	// failure (matches the old fixed hot-loop cadence for one attempt).
+	sigBackoffStart = 2 * time.Second
+	// sigBackoffMax caps the re-verify delay so a bad app is retried
+	// rarely rather than every rescan tick.
+	sigBackoffMax = 5 * time.Minute
+	// sigQuarantineAfter is the number of consecutive same-hash
+	// signature failures after which the app is considered quarantined.
+	// Quarantine only slows re-verification to the sigBackoffMax tier;
+	// it never crashes the supervisor — the bad app is merely isolated.
+	sigQuarantineAfter = 5
+)
+
+// sigFailRecord tracks a single install dir's manifest-signature failure
+// state so identical failures are logged once and retried with backoff.
+type sigFailRecord struct {
+	hash        string        // sha256 hex of the manifest bytes that failed
+	fails       int           // consecutive failures for this exact hash
+	backoff     time.Duration // current re-verify delay
+	nextRetry   time.Time     // earliest time to re-run VerifySignature
+	logged      bool          // failure already logged for this hash (dedup)
+	quarantined bool          // quarantine line already emitted for this hash
+}
+
+// sha256Hex returns the hex-encoded sha256 of b. Used to key
+// signature-failure dedup on manifest content so a changed manifest
+// re-attempts and re-logs.
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// shouldAttemptSignature reports whether scanInstalled should run the
+// ed25519 signature check for the app in dirName whose manifest bytes
+// hash to `hash`. A never-failed app, or one whose manifest changed
+// (new hash), always attempts. A same-hash failure is attempted only
+// once its backoff timer has elapsed — this is what stops the hot loop.
+func (s *supervisor) shouldAttemptSignature(dirName, hash string) bool {
+	s.sigMu.Lock()
+	defer s.sigMu.Unlock()
+	rec, ok := s.sigFails[dirName]
+	if !ok || rec.hash != hash {
+		return true
+	}
+	return !time.Now().Before(rec.nextRetry)
+}
+
+// noteSignatureFailure records a manifest signature-verification failure
+// for the app in dirName. It logs at most ONCE per distinct manifest
+// hash (an identical failure on the next rescan tick is silent), applies
+// capped exponential backoff between retries, and emits a single
+// quarantine line after sigQuarantineAfter consecutive same-hash
+// failures. A changed manifest (different hash) resets state and re-logs.
+func (s *supervisor) noteSignatureFailure(dirName, appID, hash string, verr error) {
+	s.sigMu.Lock()
+	rec, ok := s.sigFails[dirName]
+	if !ok || rec.hash != hash {
+		rec = &sigFailRecord{hash: hash, backoff: sigBackoffStart}
+		s.sigFails[dirName] = rec
+	} else {
+		rec.backoff = nextBackoff(rec.backoff, sigBackoffMax)
+	}
+	rec.fails++
+	rec.nextRetry = time.Now().Add(rec.backoff)
+	firstForHash := !rec.logged
+	rec.logged = true
+	failsN := rec.fails
+	emitQuarantine := failsN >= sigQuarantineAfter && !rec.quarantined
+	if emitQuarantine {
+		rec.quarantined = true
+	}
+	s.sigMu.Unlock()
+
+	if firstForHash {
+		s.logger.Printf("app=%s (%s): manifest signature verification failed: %v — deduping identical failures, retrying with backoff", appID, dirName, verr)
+	}
+	if emitQuarantine {
+		s.logger.Printf("app=%s (%s): quarantined after %d consecutive signature failures for manifest %s — retrying only on slow backoff until the manifest changes or is re-installed", appID, dirName, failsN, hash[:12])
+	}
+}
+
+// clearSignatureFailure drops any signature-failure state for dirName.
+// Called when the signature verifies so a later transient failure starts
+// fresh and re-logs. Emits a one-line recovery note only if the app was
+// previously failing (keeps the happy path silent).
+func (s *supervisor) clearSignatureFailure(dirName, appID string) {
+	s.sigMu.Lock()
+	_, existed := s.sigFails[dirName]
+	delete(s.sigFails, dirName)
+	s.sigMu.Unlock()
+	if existed {
+		s.logger.Printf("app=%s (%s): manifest signature now verifies — cleared signature quarantine", appID, dirName)
+	}
+}
+
 // scanInstalled walks InstallRoot, reads each `<app>/manifest.json`, and
 // returns the verified-by-syntax set. Sha256 verification is per-launch
 // (in run()), not per-scan, so a corrupted binary surfaces at the right
@@ -343,8 +453,19 @@ func (s *supervisor) scanInstalled() ([]*installedApp, error) {
 			// to the release-signed catalogue: it must equal the publisher key
 			// the catalogue pins for this app id. Both are required; sideloading
 			// (above) is the explicit, local opt-out of this chain.
+			//
+			// Either check failing must NOT hot-loop: a skipped app is
+			// never registered, so it is re-examined on every rescan tick.
+			// We dedup the log by manifest hash, back off between
+			// re-verifications, and quarantine after repeated failures.
+			hash := sha256Hex(data)
+			if !s.shouldAttemptSignature(e.Name(), hash) {
+				// Still in backoff/quarantine for this exact manifest —
+				// skip silently (no re-verify, no log line).
+				continue
+			}
 			if err := m.VerifySignature(); err != nil {
-				s.logger.Printf("skip %s: signature verification failed: %v", e.Name(), err)
+				s.noteSignatureFailure(e.Name(), m.ID, hash, err)
 				continue
 			}
 			var cataloguePub string
@@ -352,9 +473,13 @@ func (s *supervisor) scanInstalled() ([]*installedApp, error) {
 				cataloguePub, _ = s.cfg.CataloguePublisher(m.ID)
 			}
 			if err := m.VerifyTrustAnchor(cataloguePub); err != nil {
-				s.logger.Printf("skip %s: publisher not trusted: %v", e.Name(), err)
+				s.noteSignatureFailure(e.Name(), m.ID, hash, err)
 				continue
 			}
+			// Full trust chain verified — clear any prior failure state
+			// so a fixed re-install is picked up cleanly and a later
+			// transient failure re-logs.
+			s.clearSignatureFailure(e.Name(), m.ID)
 		}
 		// Reject path traversal in manifest.binary.path. Without this
 		// a manifest containing binary.path="../../../bin/sh" (or any
