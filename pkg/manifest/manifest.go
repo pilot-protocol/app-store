@@ -105,7 +105,11 @@ type Condition struct {
 type Store struct {
 	// Publisher pubkey, base64 ed25519 ("ed25519:<base64>").
 	Publisher string `json:"publisher"`
-	// Signature: store's signature over (id || manifest_version || binary.sha256 || grants-hash).
+	// Signature: store's signature over the manifest signing payload. New
+	// signatures use the v2 payload, which commits to the publisher key plus
+	// a hash of the whole manifest; the older v1 payload covered only
+	// (id || manifest_version || binary.sha256 || grants-hash) and is still
+	// accepted on verify. See SigningPayload.
 	Signature string `json:"signature"`
 }
 
@@ -177,15 +181,30 @@ func canonicalJSON(v any) ([]byte, error) {
 	return json.Marshal(v)
 }
 
-// signingPayload builds the canonical byte-string the Store.Signature
-// must sign. The publisher key is included so that a signature cannot
-// be reused with a different publisher identity — swapping the
-// publisher key invalidates the signature. Once a trust-anchor check
-// (hardcoded publisher pubkey match) is added, this guarantees the
-// manifest was signed by the known publisher.
+// SigningPayloadV2Prefix is the domain-separation tag that opens every v2
+// signing payload. It keeps v2 payload bytes disjoint from v1 payload bytes,
+// so a signature produced for one scheme can never verify under the other.
+const SigningPayloadV2Prefix = "pilot.app-manifest.v2"
+
+// AllowLegacySignaturePayload controls whether VerifySignature falls back to
+// the v1 signing payload when the v2 payload does not verify. Manifests signed
+// before v2 existed carry v1 signatures, so this defaults to true. Set it to
+// false to accept v2 signatures only.
+var AllowLegacySignaturePayload = true
+
+// signingPayloadV1 builds the original canonical byte-string for
+// Store.Signature. The publisher key is included so that a signature cannot
+// be reused with a different publisher identity — swapping the publisher key
+// invalidates the signature.
 //
 // Format: publisher || ":" || id || ":" || manifest_version || ":" || binary.sha256 || ":" || grants-sha256-hex
-func (m *Manifest) signingPayload() ([]byte, error) {
+//
+// It covers Store.Publisher, ID, ManifestVersion, Binary.SHA256 and Grants.
+// Every other manifest field — Binary.Runtime, Binary.Path, Exposes,
+// Protection, Affiliates, Depends, Extends, DynamicExtends, AppVersion — sits
+// outside these bytes and can therefore be edited without disturbing a v1
+// signature. signingPayloadV2 closes that gap.
+func (m *Manifest) signingPayloadV1() ([]byte, error) {
 	grantsJSON, err := canonicalJSON(m.Grants)
 	if err != nil {
 		return nil, fmt.Errorf("grants marshal: %w", err)
@@ -194,6 +213,65 @@ func (m *Manifest) signingPayload() ([]byte, error) {
 	payload := fmt.Sprintf("%s:%s:%d:%s:%x",
 		m.Store.Publisher, m.ID, m.ManifestVersion, m.Binary.SHA256, grantsHash)
 	return []byte(payload), nil
+}
+
+// signingPayloadV2 builds the current canonical byte-string for
+// Store.Signature. It commits to the whole manifest rather than a hand-picked
+// subset: the payload is the domain-separation prefix, the publisher key, and
+// the sha256 of the canonical JSON encoding of the manifest with
+// Store.Signature blanked out.
+//
+// Blanking Store.Signature is what makes the hash computable on both sides —
+// the signer does not yet have a signature, and the verifier must reproduce
+// the same pre-signature bytes. Everything else is included verbatim, so any
+// edit to Binary.Runtime, Binary.Path, Exposes, Protection, Affiliates,
+// Depends, Extends, DynamicExtends or AppVersion changes the hash and the
+// signature no longer verifies.
+//
+// Format: "pilot.app-manifest.v2" || ":" || publisher || ":" || manifest-sha256-hex
+func (m *Manifest) signingPayloadV2() ([]byte, error) {
+	// Shallow copy: only the Store.Signature scalar is rewritten, and the
+	// copy is discarded once hashed, so the caller's manifest is untouched.
+	unsigned := *m
+	unsigned.Store.Signature = ""
+
+	body, err := canonicalJSON(&unsigned)
+	if err != nil {
+		return nil, fmt.Errorf("manifest marshal: %w", err)
+	}
+	bodyHash := sha256.Sum256(body)
+	payload := fmt.Sprintf("%s:%s:%x", SigningPayloadV2Prefix, m.Store.Publisher, bodyHash)
+	return []byte(payload), nil
+}
+
+// SigningPayload returns the bytes a publisher must sign to produce
+// Store.Signature. New signatures use the v2 payload.
+func (m *Manifest) SigningPayload() ([]byte, error) {
+	return m.signingPayloadV2()
+}
+
+// Sign fills in Store.Signature with an ed25519 signature over the v2 signing
+// payload and returns the base64 signature it stored. Store.Publisher must
+// already be set to the "ed25519:<base64>" form of priv's public key, since the
+// publisher string is part of the payload.
+func (m *Manifest) Sign(priv ed25519.PrivateKey) (string, error) {
+	if len(priv) != ed25519.PrivateKeySize {
+		return "", fmt.Errorf("private key: wrong length %d, want %d", len(priv), ed25519.PrivateKeySize)
+	}
+	pubkey, err := decodeEd25519Pub(m.Store.Publisher)
+	if err != nil {
+		return "", fmt.Errorf("store.publisher: %w", err)
+	}
+	if !bytes.Equal(pubkey, priv.Public().(ed25519.PublicKey)) {
+		return "", fmt.Errorf("store.publisher does not match the signing key")
+	}
+	payload, err := m.signingPayloadV2()
+	if err != nil {
+		return "", err
+	}
+	sig := base64.StdEncoding.EncodeToString(ed25519.Sign(priv, payload))
+	m.Store.Signature = sig
+	return sig, nil
 }
 
 // decodeEd25519Pub parses an "ed25519:<base64>" (or bare base64) public key
@@ -245,11 +323,17 @@ func (m *Manifest) VerifyTrustAnchor(cataloguePublisher string) error {
 }
 
 // VerifySignature checks that Store.Signature is a valid ed25519
-// signature over the signing payload, verified against the Store.Publisher
-// key embedded in the manifest. This provides cryptographic integrity —
-// tampering with any manifest field that feeds the signing payload
-// (Publisher, ID, ManifestVersion, Binary.SHA256, Grants) will cause
-// verification to fail.
+// signature over a signing payload, verified against the Store.Publisher
+// key embedded in the manifest.
+//
+// Two payload versions are accepted. The v2 payload commits to the entire
+// manifest, so editing any field — including Binary.Path, Binary.Runtime,
+// Exposes, Protection, Affiliates, Depends, Extends and DynamicExtends —
+// invalidates the signature. The v1 payload covers only Publisher, ID,
+// ManifestVersion, Binary.SHA256 and Grants; it is tried as a fallback while
+// AllowLegacySignaturePayload is true so that manifests signed before v2 keep
+// verifying. New signatures should be produced with Sign / SigningPayload,
+// which emit v2.
 //
 // IMPORTANT: This does NOT check that Store.Publisher is trusted. For
 // non-sideloaded apps, callers MUST also call VerifyTrustAnchor(cataloguePublisher)
@@ -278,12 +362,23 @@ func (m *Manifest) VerifySignature() error {
 		return fmt.Errorf("store.signature: wrong signature length %d, want %d", len(sig), ed25519.SignatureSize)
 	}
 
-	payload, err := m.signingPayload()
+	payloadV2, err := m.signingPayloadV2()
 	if err != nil {
 		return err
 	}
-	if !ed25519.Verify(pubkey, payload, sig) {
-		return fmt.Errorf("store.signature: verification failed — manifest may have been tampered with")
+	if ed25519.Verify(pubkey, payloadV2, sig) {
+		return nil
 	}
-	return nil
+
+	if AllowLegacySignaturePayload {
+		payloadV1, err := m.signingPayloadV1()
+		if err != nil {
+			return err
+		}
+		if ed25519.Verify(pubkey, payloadV1, sig) {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("store.signature: verification failed — manifest contents do not match the signature")
 }
