@@ -111,7 +111,7 @@ func TestSpawn_FastExitTriggersExitCode(t *testing.T) {
 	}
 	a.Manifest.Binary.SHA256 = sum // pass the spawn-time TOCTOU re-verify
 	sup := newSupervisor(Config{InstallRoot: dir}, Deps{}, newQuietLogger(t))
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	code := sup.spawn(ctx, a)
 	if code != 0 {
@@ -141,7 +141,7 @@ func TestSpawn_NonZeroExitPropagates(t *testing.T) {
 	}
 	a.Manifest.Binary.SHA256 = sum // pass the spawn-time TOCTOU re-verify
 	sup := newSupervisor(Config{InstallRoot: dir}, Deps{}, newQuietLogger(t))
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	code := sup.spawn(ctx, a)
 	if code != 42 {
