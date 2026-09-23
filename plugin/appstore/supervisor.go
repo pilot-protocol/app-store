@@ -13,10 +13,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/pilot-protocol/app-store/pkg/ipc"
@@ -1009,7 +1009,7 @@ func (s *supervisor) spawn(ctx context.Context, a *installedApp) int {
 
 	// Reap an instance orphaned by a daemon that died without shutting
 	// its children down, before dropping the socket it may still hold.
-	if pid := s.reapStale(a); pid != 0 {
+	for _, pid := range s.reapStale(a) {
 		s.writeAuditLine(a, auditEvent{Event: "reap-orphan", PID: pid, BinaryAt: a.BinaryPath})
 	}
 
@@ -1036,7 +1036,7 @@ func (s *supervisor) spawn(ctx context.Context, a *installedApp) int {
 	cmd := exec.CommandContext(ctx, a.BinaryPath, args...)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // own process group → clean SIGTERM
+	cmd.SysProcAttr = childSysProcAttr() // own process group → clean SIGTERM
 	if a.Sideloaded {
 		// Signal sideload status to cap-aware children. Apps that
 		// honour their declared grants (e.g. the wallet) can read
@@ -1047,14 +1047,16 @@ func (s *supervisor) spawn(ctx context.Context, a *installedApp) int {
 	}
 	s.logger.Printf("app=%s spawn binary=%s socket=%s sideloaded=%v", a.Manifest.ID, a.BinaryPath, a.SocketPath, a.Sideloaded)
 
+	if lockSpawnThread {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+	}
 	if err := cmd.Start(); err != nil {
 		s.logger.Printf("app=%s start: %v", a.Manifest.ID, err)
 		s.writeAuditLine(a, auditEvent{Event: "spawn-fail", Reason: err.Error(), BinaryAt: a.BinaryPath})
 		return -1
 	}
 	s.logger.Printf("app=%s started pid=%d", a.Manifest.ID, cmd.Process.Pid)
-	s.writePidFile(a, cmd.Process.Pid)
-	defer removePidFile(a)
 	// Apply per-platform resource limits to the freshly-started
 	// child. Best-effort: a failure logs but doesn't kill the spawn
 	// (OS-wide ulimits still apply). Linux uses prlimit(2) for a
@@ -1064,6 +1066,11 @@ func (s *supervisor) spawn(ctx context.Context, a *installedApp) int {
 
 	// Watch for the socket to appear; once it does, mark ready.
 	go s.waitReady(ctx, a, 3*time.Second)
+
+	// Respawn the app if its socket disappears while it keeps running.
+	watchCtx, stopWatch := context.WithCancel(ctx)
+	defer stopWatch()
+	go s.watchSocket(watchCtx, a, cmd.Process.Pid, socketCheckInterval)
 
 	if err := cmd.Wait(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {

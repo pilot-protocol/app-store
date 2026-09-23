@@ -2,9 +2,20 @@
 
 package appstore
 
-import "errors"
+import (
+	"errors"
+	"syscall"
+)
 
-// processArgs is unsupported here; reapStale then leaves the pid alone.
+// processArgs is unsupported here; reapStale then finds nothing.
 func processArgs(pid int) ([]byte, error) {
 	return nil, errors.New("process args not supported on this platform")
 }
+
+func listPids() []int { return nil }
+
+func childSysProcAttr() *syscall.SysProcAttr {
+	return &syscall.SysProcAttr{Setpgid: true}
+}
+
+const lockSpawnThread = false
