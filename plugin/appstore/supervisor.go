@@ -1007,6 +1007,12 @@ func (s *supervisor) spawn(ctx context.Context, a *installedApp) int {
 		return -1
 	}
 
+	// Reap an instance orphaned by a daemon that died without shutting
+	// its children down, before dropping the socket it may still hold.
+	if pid := s.reapStale(a); pid != 0 {
+		s.writeAuditLine(a, auditEvent{Event: "reap-orphan", PID: pid, BinaryAt: a.BinaryPath})
+	}
+
 	// Drop a stale socket if a previous instance crashed without cleaning.
 	if _, err := os.Stat(a.SocketPath); err == nil {
 		_ = os.Remove(a.SocketPath)
@@ -1047,6 +1053,8 @@ func (s *supervisor) spawn(ctx context.Context, a *installedApp) int {
 		return -1
 	}
 	s.logger.Printf("app=%s started pid=%d", a.Manifest.ID, cmd.Process.Pid)
+	s.writePidFile(a, cmd.Process.Pid)
+	defer removePidFile(a)
 	// Apply per-platform resource limits to the freshly-started
 	// child. Best-effort: a failure logs but doesn't kill the spawn
 	// (OS-wide ulimits still apply). Linux uses prlimit(2) for a
