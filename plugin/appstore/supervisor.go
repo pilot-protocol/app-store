@@ -1037,6 +1037,12 @@ func (s *supervisor) spawn(ctx context.Context, a *installedApp) int {
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = childSysProcAttr() // own process group → clean SIGTERM
+	// Stopping the app (daemon shutdown, uninstall, a rescan that replaces
+	// it) cancels ctx. exec's default Cancel SIGKILLs only the app's own pid,
+	// so every process the app had started kept running, reparented to
+	// launchd/init, with nothing left that would ever stop it. Kill the
+	// whole process group the app leads instead (killAppGroup).
+	cmd.Cancel = func() error { return killAppGroup(cmd.Process) }
 	if a.Sideloaded {
 		// Signal sideload status to cap-aware children. Apps that
 		// honour their declared grants (e.g. the wallet) can read

@@ -82,6 +82,20 @@ func hasArg(raw []byte, want string) bool {
 	return false
 }
 
+// killAppGroup SIGKILLs the process group a running app leads: the app and
+// any process it started that did not move itself to a group of its own
+// (setsid/setpgid). It is the app's exec.Cmd.Cancel, so it runs before
+// Wait has reaped the app: the app's pid, which is also the group id, is
+// still held (by the app, or its zombie) and cannot have been reused. When
+// the group cannot be signalled it falls back to the app alone, which is
+// what exec's default Cancel does.
+func killAppGroup(p *os.Process) error {
+	if err := syscall.Kill(-p.Pid, syscall.SIGKILL); err == nil {
+		return nil
+	}
+	return p.Kill()
+}
+
 // socketCheckInterval is how often a running app's socket is checked.
 const socketCheckInterval = 5 * time.Second
 
