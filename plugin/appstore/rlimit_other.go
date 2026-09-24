@@ -2,7 +2,12 @@
 
 package appstore
 
-import "log"
+import (
+	"log"
+	"sync"
+)
+
+var resourceLimitWarning sync.Once
 
 // applyChildResourceLimits is the non-Linux build's no-op. macOS's
 // equivalent (setrlimit) affects the calling process, not children;
@@ -14,8 +19,7 @@ import "log"
 // The addrSpaceLimit parameter is accepted for signature parity with the
 // Linux build and ignored here.
 func applyChildResourceLimits(pid int, addrSpaceLimit uint64, logger *log.Logger) {
-	// Single startup log line would be nicer than per-spawn, but
-	// inlining here keeps the supervisor call-site identical to the
-	// Linux build. Cheap log line at info level — easy to grep.
-	logger.Printf("resource limits not enforced for pid=%d on this platform (linux-only); requested addr-space cap=%d ignored", pid, addrSpaceLimit)
+	resourceLimitWarning.Do(func() {
+		logger.Print("resource limits not enforced on this platform (linux-only); child file-descriptor and address-space caps are ignored")
+	})
 }
