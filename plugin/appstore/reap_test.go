@@ -22,10 +22,18 @@ import (
 // a real supervisor process.
 const fakeDaemonEnv = "APPSTORE_TEST_FAKE_DAEMON_DIR"
 
+// fakeOrphanEnv switches the test binary into a stand-in for an orphaned
+// app (startFakeApp) that runs until its stdin closes or it is killed.
+const fakeOrphanEnv = "APPSTORE_TEST_FAKE_ORPHAN"
+
 func TestMain(m *testing.M) {
 	if dir := os.Getenv(fakeDaemonEnv); dir != "" {
 		runFakeDaemon(dir)
 		return
+	}
+	if os.Getenv(fakeOrphanEnv) != "" {
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		os.Exit(0)
 	}
 	os.Exit(m.Run())
 }
@@ -71,15 +79,30 @@ func quietSupervisor() *supervisor {
 }
 
 // startFakeApp starts a long-lived process in its own process group whose
-// argv carries the given strings, mimicking an orphaned app child.
+// argv carries the given strings, mimicking an orphaned app child. It is
+// this test binary (fakeOrphanEnv), blocked reading a pipe the test holds
+// open: its argv is final once Start returns and it never forks. A shell
+// looping over `sleep` was neither — each forked child carries the
+// shell's argv until its exec, and macOS's /bin/sh re-execs bash — so
+// reapStale could see a third instance, or miss one mid-exec.
 func startFakeApp(t *testing.T, argv ...string) *exec.Cmd {
 	t.Helper()
-	cmd := exec.Command("/bin/sh", append([]string{"-c", "while :; do sleep 1; done"}, argv...)...)
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], append([]string{"-test.run=^$"}, argv...)...)
+	cmd.Env = append(os.Environ(), fakeOrphanEnv+"=1")
+	cmd.Stdin = r
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	t.Cleanup(func() { _ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) })
+	_ = r.Close()
+	t.Cleanup(func() {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		_ = w.Close()
+	})
 	return cmd
 }
 
