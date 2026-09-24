@@ -5,6 +5,7 @@ package appstore
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -53,6 +54,23 @@ func TestStopKillsAppSubprocesses(t *testing.T) {
 	}
 	if !waitFor(5*time.Second, func() bool { return processGone(child) }) {
 		t.Fatalf("subprocess pid=%d outlived the app it belongs to", child)
+	}
+}
+
+// TestKillAppGroupFallsBackToThePid: a process that does not lead a group
+// (so there is no group to signal) is still killed, as exec's default
+// Cancel would.
+func TestKillAppGroupFallsBackToThePid(t *testing.T) {
+	cmd := exec.Command("/bin/sh", "-c", "while :; do sleep 1; done") // no Setpgid: not a leader
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	if err := killAppGroup(cmd.Process); err != nil {
+		t.Fatalf("killAppGroup: %v", err)
+	}
+	if !waitExited(cmd, 5*time.Second) {
+		t.Fatal("process survived killAppGroup")
 	}
 }
 
