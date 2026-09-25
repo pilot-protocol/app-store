@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -1328,22 +1329,28 @@ func (s *supervisor) awaitReady(ctx context.Context, appID string, timeout time.
 // ── identity hookup ────────────────────────────────────────────────────
 
 // daemonAddrFromDeps reads the daemon's pilot address out of Deps.
-// Uses Go's structural typing so the supervisor doesn't import the real
-// coreapi package — any Identity-like value with an Address() string
-// method works (which is exactly the coreapi.Identity contract).
+// The supervisor doesn't import the real coreapi package, so it looks the
+// Address method up by name: coreapi.Identity.Address() returns a
+// protocol.Addr struct (a fmt.Stringer), not a string. Asserting
+// `Address() string` never matched the real daemon, so every supervised app
+// was handed the sentinel below. A plain `Address() string` still works.
 //
 // Falls back to a sentinel when no Identity is wired (tests that pass
 // an empty Deps); the sentinel is intentionally non-routable so a
 // production misconfiguration fails fast rather than silently using
 // the wrong address.
-type identityAddresser interface {
-	Address() string
-}
-
 func daemonAddrFromDeps(deps Deps) string {
 	if deps.Identity != nil {
-		if id, ok := deps.Identity.(identityAddresser); ok {
-			if addr := id.Address(); addr != "" {
+		m := reflect.ValueOf(deps.Identity).MethodByName("Address")
+		if m.IsValid() && m.Type().NumIn() == 0 && m.Type().NumOut() == 1 {
+			var addr string
+			switch v := m.Call(nil)[0].Interface().(type) {
+			case string:
+				addr = v
+			case fmt.Stringer:
+				addr = v.String()
+			}
+			if addr != "" {
 				return addr
 			}
 		}
