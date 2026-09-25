@@ -629,7 +629,34 @@ func (s *supervisor) rescanForNew() []*installedApp {
 	for _, a := range apps {
 		if existing, ok := s.installed[a.Manifest.ID]; ok {
 			if existing.Manifest.AppVersion == a.Manifest.AppVersion {
-				continue // same version, nothing to do
+				if existing.Manifest.Binary.SHA256 == a.Manifest.Binary.SHA256 {
+					continue // same version, same binary: nothing to do
+				}
+				// Same version, different binary: a rebuilt bundle was
+				// reinstalled over the running app (`pilotctl appstore upgrade`
+				// reports "rebuilt (same version, new bundle)"). Keeping the old
+				// in-memory manifest would verify the new binary against the old
+				// pin until the app is suspended, so swap it in like an upgrade.
+				if cancel, cancelOk := s.appCancel[a.Manifest.ID]; cancelOk {
+					cancel()
+					delete(s.appCancel, a.Manifest.ID)
+				}
+				delete(s.ready, a.Manifest.ID)
+				delete(s.crashes, a.Manifest.ID)
+				if err := os.Remove(filepath.Join(a.Dir, suspendedMarkerName)); err != nil && !errors.Is(err, os.ErrNotExist) {
+					s.logger.Printf("rescan: app id=%s: remove suspended marker: %v", a.Manifest.ID, err)
+				}
+				s.logger.Printf("rescan: rebuilt bundle detected: app=%s %s binary %s → %s — restarting",
+					a.Manifest.ID, a.Manifest.AppVersion, shortSHA(existing.Manifest.Binary.SHA256), shortSHA(a.Manifest.Binary.SHA256))
+				s.writeAuditLine(a, auditEvent{
+					Event:    "rebuild-applied",
+					Reason:   fmt.Sprintf("rescan: %s rebuilt, binary %s → %s", a.Manifest.AppVersion, shortSHA(existing.Manifest.Binary.SHA256), shortSHA(a.Manifest.Binary.SHA256)),
+					SHA256:   a.Manifest.Binary.SHA256,
+					BinaryAt: a.BinaryPath,
+				})
+				s.installed[a.Manifest.ID] = a
+				fresh = append(fresh, a)
+				continue
 			}
 			if compareVersions(a.Manifest.AppVersion, existing.Manifest.AppVersion) < 0 {
 				s.logger.Printf("rescan: downgrade refused: app=%s new=%s old=%s — keeping existing version",
@@ -1383,4 +1410,12 @@ func resolveUnder(base, rel string) (string, error) {
 		return "", fmt.Errorf("path escapes %s", absBase)
 	}
 	return joined, nil
+}
+
+// shortSHA abbreviates a hex digest for log lines.
+func shortSHA(h string) string {
+	if len(h) > 12 {
+		return h[:12]
+	}
+	return h
 }
