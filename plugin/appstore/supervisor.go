@@ -1037,6 +1037,14 @@ func (s *supervisor) spawn(ctx context.Context, a *installedApp) int {
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = childSysProcAttr() // own process group → clean SIGTERM
+	// Stopping the app (daemon shutdown, uninstall, a rescan that replaces
+	// it) cancels ctx. exec's default Cancel SIGKILLs only the app's own pid,
+	// so every process the app had started kept running, reparented to
+	// launchd/init, with nothing left that would ever stop it, and the app
+	// itself never ran its shutdown path. SIGTERM the whole process group
+	// the app leads, give it appStopGrace to exit, then SIGKILL the group
+	// (stopAppGroup).
+	cmd.Cancel = func() error { return stopAppGroup(cmd.Process, appStopGrace) }
 	if a.Sideloaded {
 		// Signal sideload status to cap-aware children. Apps that
 		// honour their declared grants (e.g. the wallet) can read
@@ -1073,6 +1081,12 @@ func (s *supervisor) spawn(ctx context.Context, a *installedApp) int {
 	go s.watchSocket(watchCtx, a, cmd.Process.Pid, socketCheckInterval)
 
 	if err := cmd.Wait(); err != nil {
+		if ctx.Err() != nil && cmd.ProcessState != nil {
+			// Stopped by us (cmd.Cancel). Wait reports ctx's error even
+			// when the app shut down cleanly; report how it exited.
+			s.logger.Printf("app=%s stopped: %s", a.Manifest.ID, cmd.ProcessState)
+			return cmd.ProcessState.ExitCode()
+		}
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			return exitErr.ExitCode()
 		}
