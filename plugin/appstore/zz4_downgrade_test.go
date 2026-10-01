@@ -146,6 +146,13 @@ func TestRegisterSameVersionIsIdempotent(t *testing.T) {
 // verification (PILOT-98) accepts it.
 func writeAppDirWithVersion(t *testing.T, root, id, version string) string {
 	t.Helper()
+	return writeAppDirWithVersionSHA(t, root, id, version, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+}
+
+// writeAppDirWithVersionSHA is writeAppDirWithVersion with an explicit
+// binary.sha256 pin, to model a rebuilt bundle at the same version.
+func writeAppDirWithVersionSHA(t *testing.T, root, id, version, binSHA string) string {
+	t.Helper()
 	dir := filepath.Join(root, id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
@@ -162,8 +169,8 @@ func writeAppDirWithVersion(t *testing.T, root, id, version string) string {
 	pubB64 := base64.StdEncoding.EncodeToString(pub)
 
 	template := fmt.Sprintf(
-		`{"id":%q,"app_version":%q,"manifest_version":1,"binary":{"runtime":"go","path":"bin/x","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"grants":[{"cap":"net.dial","target":"*"}],"store":{"publisher":"ed25519:%s","signature":""}}`,
-		id, version, pubB64,
+		`{"id":%q,"app_version":%q,"manifest_version":1,"binary":{"runtime":"go","path":"bin/x","sha256":%q},"grants":[{"cap":"net.dial","target":"*"}],"store":{"publisher":"ed25519:%s","signature":""}}`,
+		id, version, binSHA, pubB64,
 	)
 	m, err := manifest.Parse([]byte(template))
 	if err != nil {
@@ -339,5 +346,63 @@ func TestRescanAuditLogsDowngradeRefusal(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "downgrade-refused") {
 		t.Errorf("audit log missing downgrade-refused event:\n%s", string(data))
+	}
+}
+
+// TestRescanAppliesSameVersionRebuild: reinstalling a rebuilt bundle at the
+// same version (new binary, new pin) while the daemon runs must swap the new
+// manifest in. Before, rescan skipped any same-version manifest, so the
+// supervisor verified the new binary against the old pin until it suspended
+// the app ("sha256 mismatch ... >=10 consecutive verify failures").
+func TestRescanAppliesSameVersionRebuild(t *testing.T) {
+	root := t.TempDir()
+	oldSHA := strings.Repeat("a", 64)
+	newSHA := strings.Repeat("b", 64)
+	appDir := writeAppDirWithVersionSHA(t, root, "io.test.app", "1.0.0", oldSHA)
+
+	sup := newSupervisor(Config{
+		CataloguePublisher: testCatPub,
+		InstallRoot:        root,
+		RescanInterval:     20 * 1e6,
+	}, Deps{}, newQuietLogger(t))
+	if fresh := sup.rescanForNew(); len(fresh) != 1 {
+		t.Fatalf("initial discovery: fresh=%d, want 1", len(fresh))
+	}
+	// Unchanged on disk: nothing to do.
+	if fresh := sup.rescanForNew(); len(fresh) != 0 {
+		t.Fatalf("unchanged manifest re-registered: fresh=%d", len(fresh))
+	}
+	canceled := false
+	sup.mu.Lock()
+	sup.appCancel["io.test.app"] = func() { canceled = true }
+	sup.crashes["io.test.app"] = &crashRecord{}
+	sup.mu.Unlock()
+	if err := os.WriteFile(filepath.Join(appDir, suspendedMarkerName), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	writeAppDirWithVersionSHA(t, root, "io.test.app", "1.0.0", newSHA)
+	if fresh := sup.rescanForNew(); len(fresh) != 1 {
+		t.Fatalf("rebuild not applied: fresh=%d, want 1", len(fresh))
+	}
+	sup.mu.RLock()
+	got := sup.installed["io.test.app"].Manifest.Binary.SHA256
+	_, crashKept := sup.crashes["io.test.app"]
+	sup.mu.RUnlock()
+	if got != newSHA {
+		t.Errorf("in-memory pin = %s, want the rebuilt binary's %s", got, newSHA)
+	}
+	if !canceled {
+		t.Error("the old supervise goroutine was not canceled")
+	}
+	if crashKept {
+		t.Error("crash record not cleared for the rebuilt app")
+	}
+	if _, err := os.Stat(filepath.Join(appDir, suspendedMarkerName)); !os.IsNotExist(err) {
+		t.Errorf(".suspended marker should be cleared, stat err=%v", err)
+	}
+	data, _ := os.ReadFile(filepath.Join(appDir, supervisorLogName))
+	if !strings.Contains(string(data), "rebuild-applied") {
+		t.Errorf("audit log missing rebuild-applied:\n%s", data)
 	}
 }
