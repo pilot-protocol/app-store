@@ -12,6 +12,9 @@ import (
 // it is SIGKILLed.
 const reapGrace = 3 * time.Second
 
+// reapPasses bounds how many times reapStale rescans the process table.
+const reapPasses = 3
+
 // Children run in their own process group (Setpgid), so when the daemon
 // dies without running its shutdown path — the rx watchdog's os.Exit for
 // supervisor respawn, SIGKILL, a crash — nothing signals them and they are
@@ -28,27 +31,49 @@ const reapGrace = 3 * time.Second
 // versions that predate this check, and never touches a recycled pid.
 // Returns the pids it reaped.
 func (s *supervisor) reapStale(a *installedApp) []int {
-	pids := findInstances(a.BinaryPath, a.SocketPath)
-	for _, pid := range pids {
-		s.logger.Printf("app=%s: reaping stale instance pid=%d left by a previous daemon", a.Manifest.ID, pid)
-		// Negative pid → the whole process group the child leads; fall
-		// back to the pid alone if it no longer leads a group.
-		if syscall.Kill(-pid, syscall.SIGTERM) != nil {
-			_ = syscall.Kill(pid, syscall.SIGTERM)
-		}
-	}
-	deadline := time.Now().Add(reapGrace)
-	for _, pid := range pids {
-		for time.Now().Before(deadline) && syscall.Kill(pid, 0) == nil {
-			time.Sleep(50 * time.Millisecond)
-		}
-		if syscall.Kill(pid, 0) == nil {
-			if syscall.Kill(-pid, syscall.SIGKILL) != nil {
-				_ = syscall.Kill(pid, syscall.SIGKILL)
+	var reaped []int
+	seen := map[int]bool{}
+	// Several passes: reading a process's argv can fail transiently (e.g. on
+	// macOS while it is mid-fork), so one scan can miss an instance.
+	for pass := 0; pass < reapPasses; pass++ {
+		var pids []int
+		for _, pid := range findInstances(a.BinaryPath, a.SocketPath) {
+			if !seen[pid] {
+				seen[pid] = true
+				pids = append(pids, pid)
 			}
 		}
+		if len(pids) == 0 {
+			if pass > 0 || len(reaped) > 0 {
+				break
+			}
+			// Nothing on the first scan: one quick re-check covers a
+			// transient argv read failure.
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		for _, pid := range pids {
+			s.logger.Printf("app=%s: reaping stale instance pid=%d left by a previous daemon", a.Manifest.ID, pid)
+			// Negative pid → the whole process group the child leads; fall
+			// back to the pid alone if it no longer leads a group.
+			if syscall.Kill(-pid, syscall.SIGTERM) != nil {
+				_ = syscall.Kill(pid, syscall.SIGTERM)
+			}
+		}
+		deadline := time.Now().Add(reapGrace)
+		for _, pid := range pids {
+			for time.Now().Before(deadline) && syscall.Kill(pid, 0) == nil {
+				time.Sleep(50 * time.Millisecond)
+			}
+			if syscall.Kill(pid, 0) == nil {
+				if syscall.Kill(-pid, syscall.SIGKILL) != nil {
+					_ = syscall.Kill(pid, syscall.SIGKILL)
+				}
+			}
+		}
+		reaped = append(reaped, pids...)
 	}
-	return pids
+	return reaped
 }
 
 // findInstances returns the pids (other than this process) whose argv
@@ -82,6 +107,63 @@ func hasArg(raw []byte, want string) bool {
 	return false
 }
 
+// killAppGroup SIGKILLs the process group a running app leads: the app and
+// any process it started that did not move itself to a group of its own
+// (setsid/setpgid). It is the app's exec.Cmd.Cancel, so it runs before
+// Wait has reaped the app: the app's pid, which is also the group id, is
+// still held (by the app, or its zombie) and cannot have been reused. When
+// the group cannot be signalled it falls back to the app alone, which is
+// what exec's default Cancel does.
+func killAppGroup(p *os.Process) error {
+	if err := syscall.Kill(-p.Pid, syscall.SIGKILL); err == nil {
+		return nil
+	}
+	return p.Kill()
+}
+
+// appStopGrace is how long a stopped app gets to run its own shutdown
+// after SIGTERM before its process group is SIGKILLed. It fits inside the
+// daemon's 5s plugin stop budget (pilotprotocol cmd/daemon
+// pluginStopTimeout); apps are stopped in parallel.
+const appStopGrace = 3 * time.Second
+
+// stopPollInterval is how often stopAppGroup checks whether the app has
+// exited during its grace period.
+const stopPollInterval = 20 * time.Millisecond
+
+// stopAppGroup is the app's exec.Cmd.Cancel. It asks the process group
+// the app leads to terminate (SIGTERM), so the app runs its shutdown path:
+// finish in-flight calls, close its database, remove its socket. If the
+// app is still running after grace, the whole group is SIGKILLed
+// (killAppGroup), so nothing the app started outlives it.
+//
+// It returns once the app has exited. Exec's Wait reaps the app
+// concurrently; once it has, Signal reports os.ErrProcessDone. Until then
+// the app's pid, which is also the group id, is held by the app or its
+// zombie, so the group signals cannot reach a recycled pid.
+func stopAppGroup(p *os.Process, grace time.Duration) error {
+	// exec can call Cancel after Wait has already reaped the app (ctx
+	// cancelled just as it exited). Then there is nothing to stop, and its
+	// pid must not be signalled as a group.
+	if err := p.Signal(syscall.Signal(0)); err != nil {
+		return err
+	}
+	if syscall.Kill(-p.Pid, syscall.SIGTERM) != nil {
+		// Not a group leader (or already gone): the app alone.
+		if err := p.Signal(syscall.SIGTERM); err != nil {
+			return err // os.ErrProcessDone: it already exited
+		}
+	}
+	deadline := time.Now().Add(grace)
+	for time.Now().Before(deadline) {
+		if p.Signal(syscall.Signal(0)) != nil {
+			return nil // exited and reaped
+		}
+		time.Sleep(stopPollInterval)
+	}
+	return killAppGroup(p)
+}
+
 // socketCheckInterval is how often a running app's socket is checked.
 const socketCheckInterval = 5 * time.Second
 
@@ -100,6 +182,11 @@ func (s *supervisor) watchSocket(ctx context.Context, a *installedApp, pid int, 
 		case <-ctx.Done():
 			return
 		case <-t.C:
+		}
+		if ctx.Err() != nil {
+			// Being stopped: the app removing its socket on SIGTERM is
+			// its normal shutdown, not a lost socket.
+			return
 		}
 		_, err := os.Stat(a.SocketPath)
 		switch {
