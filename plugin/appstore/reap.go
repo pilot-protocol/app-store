@@ -12,6 +12,9 @@ import (
 // it is SIGKILLed.
 const reapGrace = 3 * time.Second
 
+// reapPasses bounds how many times reapStale rescans the process table.
+const reapPasses = 3
+
 // Children run in their own process group (Setpgid), so when the daemon
 // dies without running its shutdown path — the rx watchdog's os.Exit for
 // supervisor respawn, SIGKILL, a crash — nothing signals them and they are
@@ -28,27 +31,49 @@ const reapGrace = 3 * time.Second
 // versions that predate this check, and never touches a recycled pid.
 // Returns the pids it reaped.
 func (s *supervisor) reapStale(a *installedApp) []int {
-	pids := findInstances(a.BinaryPath, a.SocketPath)
-	for _, pid := range pids {
-		s.logger.Printf("app=%s: reaping stale instance pid=%d left by a previous daemon", a.Manifest.ID, pid)
-		// Negative pid → the whole process group the child leads; fall
-		// back to the pid alone if it no longer leads a group.
-		if syscall.Kill(-pid, syscall.SIGTERM) != nil {
-			_ = syscall.Kill(pid, syscall.SIGTERM)
-		}
-	}
-	deadline := time.Now().Add(reapGrace)
-	for _, pid := range pids {
-		for time.Now().Before(deadline) && syscall.Kill(pid, 0) == nil {
-			time.Sleep(50 * time.Millisecond)
-		}
-		if syscall.Kill(pid, 0) == nil {
-			if syscall.Kill(-pid, syscall.SIGKILL) != nil {
-				_ = syscall.Kill(pid, syscall.SIGKILL)
+	var reaped []int
+	seen := map[int]bool{}
+	// Several passes: reading a process's argv can fail transiently (e.g. on
+	// macOS while it is mid-fork), so one scan can miss an instance.
+	for pass := 0; pass < reapPasses; pass++ {
+		var pids []int
+		for _, pid := range findInstances(a.BinaryPath, a.SocketPath) {
+			if !seen[pid] {
+				seen[pid] = true
+				pids = append(pids, pid)
 			}
 		}
+		if len(pids) == 0 {
+			if pass > 0 || len(reaped) > 0 {
+				break
+			}
+			// Nothing on the first scan: one quick re-check covers a
+			// transient argv read failure.
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		for _, pid := range pids {
+			s.logger.Printf("app=%s: reaping stale instance pid=%d left by a previous daemon", a.Manifest.ID, pid)
+			// Negative pid → the whole process group the child leads; fall
+			// back to the pid alone if it no longer leads a group.
+			if syscall.Kill(-pid, syscall.SIGTERM) != nil {
+				_ = syscall.Kill(pid, syscall.SIGTERM)
+			}
+		}
+		deadline := time.Now().Add(reapGrace)
+		for _, pid := range pids {
+			for time.Now().Before(deadline) && syscall.Kill(pid, 0) == nil {
+				time.Sleep(50 * time.Millisecond)
+			}
+			if syscall.Kill(pid, 0) == nil {
+				if syscall.Kill(-pid, syscall.SIGKILL) != nil {
+					_ = syscall.Kill(pid, syscall.SIGKILL)
+				}
+			}
+		}
+		reaped = append(reaped, pids...)
 	}
-	return pids
+	return reaped
 }
 
 // findInstances returns the pids (other than this process) whose argv
