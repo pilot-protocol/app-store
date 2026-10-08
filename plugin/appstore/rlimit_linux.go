@@ -3,7 +3,6 @@
 package appstore
 
 import (
-	"log"
 	"syscall"
 	"unsafe"
 )
@@ -44,7 +43,7 @@ type rlimit64 struct {
 // There is a tiny race: between cmd.Start and prlimit landing, the
 // child can allocate. For an app starting from a clean state that's a
 // handful of fds / a small allocation — well under the caps.
-func applyChildResourceLimits(pid int, addrSpaceLimit uint64, logger *log.Logger) {
+func applyChildResourceLimits(pid int, addrSpaceLimit uint64, logger *appLogger) {
 	setLimit := func(resource int, name string, val uint64) {
 		want := rlimit64{Cur: val, Max: val}
 		// SYS_PRLIMIT64 takes (pid, resource, *new_limit, *old_limit).
@@ -57,7 +56,7 @@ func applyChildResourceLimits(pid int, addrSpaceLimit uint64, logger *log.Logger
 			0, 0, 0,
 		)
 		if errno != 0 {
-			logger.Printf("prlimit pid=%d %s=%d: %v (proceeding; OS-wide ulimit still applies)", pid, name, val, errno)
+			logger.Warnf("prlimit pid=%d %s=%d: %v (proceeding; OS-wide ulimit still applies)", pid, name, val, errno)
 			return
 		}
 		logger.Printf("prlimit pid=%d %s=%d ok", pid, name, val)

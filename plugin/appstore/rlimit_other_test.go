@@ -17,7 +17,7 @@ func TestResourceLimitWarningOnce(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := 0; i < 20; i++ {
 		wg.Add(1)
-		go func(pid int) { defer wg.Done(); applyChildResourceLimits(pid, 4<<30, logger) }(i)
+		go func(pid int) { defer wg.Done(); applyChildResourceLimits(pid, 4<<30, newAppLogger(logger, nil)) }(i)
 	}
 	wg.Wait()
 	if got := strings.Count(output.String(), "resource limits not enforced"); got != 1 {

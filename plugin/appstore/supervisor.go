@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net"
 	"os"
@@ -86,13 +87,16 @@ func (s *supervisor) writeAuditLine(a *installedApp, ev auditEvent) {
 	path := filepath.Join(a.Dir, supervisorLogName)
 	s.rotateAuditIfLarge(a.Dir)
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if errors.Is(err, fs.ErrNotExist) {
+		return // the app's dir is gone: it was uninstalled
+	}
 	if err != nil {
-		s.logger.Printf("audit open %s: %v", path, err)
+		s.logger.Warnf("audit open %s: %v", path, err)
 		return
 	}
 	defer f.Close()
 	if _, err := f.Write(body); err != nil {
-		s.logger.Printf("audit write %s: %v", path, err)
+		s.logger.Warnf("audit write %s: %v", path, err)
 	}
 }
 
@@ -141,7 +145,7 @@ func (s *supervisor) rotateGenerations(appDir string, keep int) {
 	}
 	// Discard the generation that would fall off the end.
 	if err := os.Remove(gen(keep)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		s.logger.Printf("audit rotate: remove %s: %v", gen(keep), err)
+		s.logger.Warnf("audit rotate: remove %s: %v", gen(keep), err)
 	}
 	// Shift each surviving generation down one slot, oldest first so we
 	// never clobber a file we still need to move.
@@ -151,7 +155,7 @@ func (s *supervisor) rotateGenerations(appDir string, keep int) {
 			continue // gap in the chain — nothing to move
 		}
 		if err := os.Rename(src, dst); err != nil {
-			s.logger.Printf("audit rotate %s → %s: %v", src, dst, err)
+			s.logger.Warnf("audit rotate %s → %s: %v", src, dst, err)
 		}
 	}
 }
@@ -162,7 +166,7 @@ func (s *supervisor) rotateGenerations(appDir string, keep int) {
 type supervisor struct {
 	cfg    Config
 	deps   Deps
-	logger *log.Logger
+	logger *appLogger
 
 	// mu guards installed + ready + crashes + appCancel.
 	mu        sync.RWMutex
@@ -171,12 +175,18 @@ type supervisor struct {
 	crashes   map[string]*crashRecord       // app_id → sliding-window crash counter
 	appCancel map[string]context.CancelFunc // app_id → cancel its per-app context (used to stop a supervise goroutine on detected uninstall)
 
-	// sigMu guards sigFails and misnamed. Kept separate from mu because
+	// sigMu guards sigFails, skipLogged and warned. Kept separate from mu because
 	// this bookkeeping happens inside scanInstalled, which must not hold
 	// the main lock while walking the filesystem.
-	sigMu    sync.Mutex
-	sigFails map[string]*sigFailRecord // install-dir name → manifest-signature failure state
-	misnamed map[string]bool           // install-dir names skipped (and logged) because they are not their manifest's app ID
+	sigMu      sync.Mutex
+	sigFails   map[string]*sigFailRecord // install-dir name → manifest-signature failure state
+	skipLogged map[string]string         // install-dir name → the skip line last logged for it (noteSkipped)
+	warned     map[string]string         // condition key → the warning last logged for it (warnOnce)
+
+	// reinstalled marks an app whose running process watchSocket stopped
+	// because its install dir was replaced (pilotctl reinstalled it): its
+	// exit is not a crash. Guarded by mu.
+	reinstalled map[string]bool
 }
 
 func newSupervisor(cfg Config, deps Deps, logger *log.Logger) *supervisor {
@@ -185,15 +195,17 @@ func newSupervisor(cfg Config, deps Deps, logger *log.Logger) *supervisor {
 		deps.Telemetry = noopEmitter{}
 	}
 	return &supervisor{
-		cfg:       cfg,
-		deps:      deps,
-		logger:    logger,
-		installed: map[string]*installedApp{},
-		ready:     map[string]bool{},
-		crashes:   map[string]*crashRecord{},
-		appCancel: map[string]context.CancelFunc{},
-		sigFails:  map[string]*sigFailRecord{},
-		misnamed:  map[string]bool{},
+		cfg:         cfg,
+		deps:        deps,
+		logger:      newAppLogger(logger, cfg.Slog),
+		installed:   map[string]*installedApp{},
+		ready:       map[string]bool{},
+		crashes:     map[string]*crashRecord{},
+		appCancel:   map[string]context.CancelFunc{},
+		sigFails:    map[string]*sigFailRecord{},
+		skipLogged:  map[string]string{},
+		warned:      map[string]string{},
+		reinstalled: map[string]bool{},
 	}
 }
 
@@ -381,10 +393,10 @@ func (s *supervisor) noteSignatureFailure(dirName, appID, hash string, verr erro
 	s.sigMu.Unlock()
 
 	if firstForHash {
-		s.logger.Printf("app=%s (%s): manifest signature verification failed: %v — deduping identical failures, retrying with backoff", appID, dirName, verr)
+		s.logger.Warnf("app=%s (%s): manifest signature verification failed: %v — deduping identical failures, retrying with backoff", appID, dirName, verr)
 	}
 	if emitQuarantine {
-		s.logger.Printf("app=%s (%s): quarantined after %d consecutive signature failures for manifest %s — retrying only on slow backoff until the manifest changes or is re-installed", appID, dirName, failsN, hash[:12])
+		s.logger.Warnf("app=%s (%s): quarantined after %d consecutive signature failures for manifest %s — retrying only on slow backoff until the manifest changes or is re-installed", appID, dirName, failsN, hash[:12])
 	}
 }
 
@@ -402,37 +414,52 @@ func (s *supervisor) clearSignatureFailure(dirName, appID string) {
 	}
 }
 
-// noteMisnamed logs the install dirs one scan skipped because their name is
-// not their manifest's app ID (skipped maps dir name → app ID; present holds
-// every dir name in the scan). Each dir is logged once, not on every rescan
-// tick; a name absent from this scan is forgotten, so a dir that comes back
-// later (the next install's staging dir) is logged again.
-//
-// An <id>.previous with no <id> beside it is an install interrupted mid-swap:
-// the app is no longer running, so that line says how to restore it.
-func (s *supervisor) noteMisnamed(skipped map[string]string, present map[string]bool) {
+// skipNote is why one scan skipped an install-root dir: the line to log
+// and whether it is a problem (WARN) or routine (INFO).
+type skipNote struct {
+	msg  string
+	warn bool
+}
+
+// noteSkipped logs the install-root dirs one scan skipped (keyed by dir
+// name). The rescan runs every few seconds, so each dir is logged once, and
+// again only when its reason changes; a name absent from this scan is
+// forgotten, so a dir that comes back later (the next install's staging
+// dir) is logged again. Logging every tick filled the daemon's log: a dir
+// holding only an app's state was logged 1,574 times in under an hour.
+func (s *supervisor) noteSkipped(skipped map[string]skipNote) {
 	s.sigMu.Lock()
 	var fresh []string
-	for name := range skipped {
-		if !s.misnamed[name] {
+	for name, n := range skipped {
+		if s.skipLogged[name] != n.msg {
 			fresh = append(fresh, name)
 		}
 	}
-	s.misnamed = make(map[string]bool, len(skipped))
-	for name := range skipped {
-		s.misnamed[name] = true
+	s.skipLogged = make(map[string]string, len(skipped))
+	for name, n := range skipped {
+		s.skipLogged[name] = n.msg
 	}
 	s.sigMu.Unlock()
 
 	sort.Strings(fresh)
 	for _, name := range fresh {
-		id := skipped[name]
-		if strings.HasPrefix(name, id+".previous") && !present[id] {
-			s.logger.Printf("skip %s: app %s is not installed, and this is its previous install, left by an install that did not finish — run `pilotctl appstore install %s` to restore it", name, id, id)
-			continue
+		if n := skipped[name]; n.warn {
+			s.logger.Warnf("%s", n.msg)
+		} else {
+			s.logger.Printf("%s", n.msg)
 		}
-		s.logger.Printf("skip %s: dir name is not its app id %s (an install's staging or replaced dir) — not adopting", name, id)
 	}
+}
+
+// misnamedNote is the skip note for a dir holding a valid manifest for app
+// id under another name (present holds every dir name in the scan). An
+// <id>.previous with no <id> beside it is an install interrupted mid-swap:
+// the app is no longer running, so that note says how to restore it.
+func misnamedNote(name, id string, present map[string]bool) skipNote {
+	if strings.HasPrefix(name, id+".previous") && !present[id] {
+		return skipNote{warn: true, msg: fmt.Sprintf("skip %s: app %s is not installed, and this is its previous install, left by an install that did not finish — run `pilotctl appstore install %s` to restore it", name, id, id)}
+	}
+	return skipNote{msg: fmt.Sprintf("skip %s: dir name is not its app id %s (an install's staging or replaced dir) — not adopting", name, id)}
 }
 
 // scanInstalled walks InstallRoot, reads each `<app>/manifest.json`, and
@@ -451,7 +478,8 @@ func (s *supervisor) scanInstalled() ([]*installedApp, error) {
 		return nil, err
 	}
 	var out []*installedApp
-	misnamed := map[string]string{} // dir name → app ID, for noteMisnamed
+	skipped := map[string]skipNote{} // dir name → why it was skipped, for noteSkipped
+	misnamed := map[string]string{}  // dir name → app ID
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
@@ -459,17 +487,23 @@ func (s *supervisor) scanInstalled() ([]*installedApp, error) {
 		dir := filepath.Join(s.cfg.InstallRoot, e.Name())
 		mfPath := filepath.Join(dir, "manifest.json")
 		data, err := os.ReadFile(mfPath)
+		if _, lerr := os.Lstat(mfPath); errors.Is(err, fs.ErrNotExist) && errors.Is(lerr, fs.ErrNotExist) {
+			// Not an install: an app run outside the daemon can keep its
+			// state under its id here (the wallet's identity-evm.json).
+			skipped[e.Name()] = skipNote{msg: fmt.Sprintf("skip %s: no manifest.json — not an installed app; left alone", e.Name())}
+			continue
+		}
 		if err != nil {
-			s.logger.Printf("skip %s: read manifest: %v", e.Name(), err)
+			skipped[e.Name()] = skipNote{warn: true, msg: fmt.Sprintf("skip %s: read manifest: %v", e.Name(), err)}
 			continue
 		}
 		m, err := manifest.Parse(data)
 		if err != nil {
-			s.logger.Printf("skip %s: parse: %v", e.Name(), err)
+			skipped[e.Name()] = skipNote{warn: true, msg: fmt.Sprintf("skip %s: parse: %v", e.Name(), err)}
 			continue
 		}
 		if errs := m.Validate(); len(errs) != 0 {
-			s.logger.Printf("skip %s: invalid manifest: %v", e.Name(), errs[0])
+			skipped[e.Name()] = skipNote{warn: true, msg: fmt.Sprintf("skip %s: invalid manifest: %v", e.Name(), errs[0])}
 			continue
 		}
 		// Only <InstallRoot>/<id> is an install. pilotctl's install leaves
@@ -494,7 +528,7 @@ func (s *supervisor) scanInstalled() ([]*installedApp, error) {
 		sideloaded := sideErr == nil
 		if sideloaded {
 			if err := manifest.EnforceSideloadPolicy(m); err != nil {
-				s.logger.Printf("skip %s: sideload policy violation: %v", e.Name(), err)
+				skipped[e.Name()] = skipNote{warn: true, msg: fmt.Sprintf("skip %s: sideload policy violation: %v", e.Name(), err)}
 				continue
 			}
 		} else {
@@ -541,7 +575,7 @@ func (s *supervisor) scanInstalled() ([]*installedApp, error) {
 		// binaries under the daemon's uid.
 		binaryPath, err := resolveUnder(dir, m.Binary.Path)
 		if err != nil {
-			s.logger.Printf("skip %s: binary path %q escapes app dir: %v", e.Name(), m.Binary.Path, err)
+			skipped[e.Name()] = skipNote{warn: true, msg: fmt.Sprintf("skip %s: binary path %q escapes app dir: %v", e.Name(), m.Binary.Path, err)}
 			continue
 		}
 		// Reject symlinks on the resolved binary. An attacker with
@@ -552,7 +586,7 @@ func (s *supervisor) scanInstalled() ([]*installedApp, error) {
 		// right error when it tries to exec. We only refuse a path
 		// that EXISTS AS A SYMLINK.
 		if fi, err := os.Lstat(binaryPath); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-			s.logger.Printf("skip %s: binary path %s is a symlink (refusing)", e.Name(), binaryPath)
+			skipped[e.Name()] = skipNote{warn: true, msg: fmt.Sprintf("skip %s: binary path %s is a symlink (refusing)", e.Name(), binaryPath)}
 			continue
 		}
 		out = append(out, &installedApp{
@@ -569,7 +603,10 @@ func (s *supervisor) scanInstalled() ([]*installedApp, error) {
 	for _, e := range entries {
 		present[e.Name()] = true
 	}
-	s.noteMisnamed(misnamed, present)
+	for name, id := range misnamed {
+		skipped[name] = misnamedNote(name, id, present)
+	}
+	s.noteSkipped(skipped)
 	return out, nil
 }
 
@@ -588,7 +625,7 @@ func (s *supervisor) registerInstalled(apps []*installedApp) {
 	for _, a := range apps {
 		if existing, ok := s.installed[a.Manifest.ID]; ok {
 			if compareVersions(a.Manifest.AppVersion, existing.Manifest.AppVersion) < 0 {
-				s.logger.Printf("downgrade refused: app=%s new=%s old=%s — keeping existing version",
+				s.logger.Warnf("downgrade refused: app=%s new=%s old=%s — keeping existing version",
 					a.Manifest.ID, a.Manifest.AppVersion, existing.Manifest.AppVersion)
 				s.writeAuditLine(a, auditEvent{Event: "downgrade-refused",
 					Reason: fmt.Sprintf("refusing %s (existing %s)", a.Manifest.AppVersion, existing.Manifest.AppVersion)})
@@ -677,9 +714,10 @@ func (s *supervisor) run(ctx context.Context, apps []*installedApp) {
 func (s *supervisor) rescanForNew() []*installedApp {
 	apps, err := s.scanInstalled()
 	if err != nil {
-		s.logger.Printf("rescan: %v", err)
+		s.warnOnce("rescan", fmt.Sprintf("rescan: %v", err))
 		return nil
 	}
+	s.clearWarned("rescan")
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var fresh []*installedApp
@@ -701,7 +739,7 @@ func (s *supervisor) rescanForNew() []*installedApp {
 				delete(s.ready, a.Manifest.ID)
 				delete(s.crashes, a.Manifest.ID)
 				if err := os.Remove(filepath.Join(a.Dir, suspendedMarkerName)); err != nil && !errors.Is(err, os.ErrNotExist) {
-					s.logger.Printf("rescan: app id=%s: remove suspended marker: %v", a.Manifest.ID, err)
+					s.logger.Warnf("rescan: app id=%s: remove suspended marker: %v", a.Manifest.ID, err)
 				}
 				s.logger.Printf("rescan: rebuilt bundle detected: app=%s %s binary %s → %s — restarting",
 					a.Manifest.ID, a.Manifest.AppVersion, shortSHA(existing.Manifest.Binary.SHA256), shortSHA(a.Manifest.Binary.SHA256))
@@ -716,12 +754,16 @@ func (s *supervisor) rescanForNew() []*installedApp {
 				continue
 			}
 			if compareVersions(a.Manifest.AppVersion, existing.Manifest.AppVersion) < 0 {
-				s.logger.Printf("rescan: downgrade refused: app=%s new=%s old=%s — keeping existing version",
-					a.Manifest.ID, a.Manifest.AppVersion, existing.Manifest.AppVersion)
-				s.writeAuditLine(a, auditEvent{Event: "downgrade-refused",
-					Reason: fmt.Sprintf("rescan: refusing %s (existing %s)", a.Manifest.AppVersion, existing.Manifest.AppVersion)})
+				// The older install stays on disk, so every rescan finds it
+				// again: say so once per version and binary on disk.
+				if s.warnOnce("downgrade/"+a.Manifest.ID, fmt.Sprintf("rescan: downgrade refused: app=%s new=%s (%s) old=%s — keeping existing version",
+					a.Manifest.ID, a.Manifest.AppVersion, shortSHA(a.Manifest.Binary.SHA256), existing.Manifest.AppVersion)) {
+					s.writeAuditLine(a, auditEvent{Event: "downgrade-refused",
+						Reason: fmt.Sprintf("rescan: refusing %s (existing %s)", a.Manifest.AppVersion, existing.Manifest.AppVersion)})
+				}
 				continue
 			}
+			s.clearWarned("downgrade/" + a.Manifest.ID)
 			// Version upgrade detected on disk: cancel the old supervise
 			// goroutine and register the new manifest. The old app
 			// will be torn down by its ctx cancel; the rescan loop
@@ -827,9 +869,10 @@ func (s *supervisor) rescanForResume() []*installedApp {
 		}
 		// Consume the marker first so a partial failure doesn't loop.
 		if err := os.Remove(markerPath); err != nil {
-			s.logger.Printf("rescan: app id=%s: remove resume marker: %v", id, err)
+			s.warnOnce("resume/"+id, fmt.Sprintf("rescan: app id=%s: remove resume marker: %v", id, err))
 			continue
 		}
+		s.clearWarned("resume/" + id)
 		// Clear the crash record so the new supervise goroutine
 		// starts with a fresh window. Also drop the stale cancel —
 		// the old goroutine has already returned (suspended apps
@@ -841,7 +884,7 @@ func (s *supervisor) rescanForResume() []*installedApp {
 		// Ignore "not exist" — could happen if the operator dropped
 		// .resume before the supervisor finished writing .suspended.
 		if err := os.Remove(filepath.Join(a.Dir, suspendedMarkerName)); err != nil && !errors.Is(err, os.ErrNotExist) {
-			s.logger.Printf("rescan: app id=%s: remove suspended marker: %v", id, err)
+			s.logger.Warnf("rescan: app id=%s: remove suspended marker: %v", id, err)
 		}
 		s.writeAuditLine(a, auditEvent{Event: "resume", Reason: "operator requested via .resume marker"})
 		s.logger.Printf("rescan: app id=%s resumed by operator request", id)
@@ -955,7 +998,7 @@ func (s *supervisor) superviseOne(ctx context.Context, a *installedApp) {
 	// Either way, the invariant after this point is: supervise goroutine
 	// is live iff .suspended is absent.
 	if err := os.Remove(filepath.Join(a.Dir, suspendedMarkerName)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		s.logger.Printf("app=%s: clear stale suspended marker: %v", a.Manifest.ID, err)
+		s.logger.Warnf("app=%s: clear stale suspended marker: %v", a.Manifest.ID, err)
 	}
 	defer func() {
 		reason := "context canceled"
@@ -986,14 +1029,14 @@ func (s *supervisor) superviseOne(ctx context.Context, a *installedApp) {
 		}
 		if err := s.verifyBinary(a); err != nil {
 			verifyFails++
-			s.logger.Printf("app=%s: verify: %v — refusing to spawn (fail %d/%d)", a.Manifest.ID, err, verifyFails, maxVerifyFails)
+			s.logger.Warnf("app=%s: verify: %v — refusing to spawn (fail %d/%d)", a.Manifest.ID, err, verifyFails, maxVerifyFails)
 			s.writeAuditLine(a, auditEvent{Event: "verify-fail", Reason: err.Error(), SHA256: a.Manifest.Binary.SHA256, BinaryAt: a.BinaryPath})
 			if verifyFails >= maxVerifyFails {
-				s.logger.Printf("app=%s: verify-fail cap reached (%d) — SUSPENDED; not respawning until daemon restart or re-install", a.Manifest.ID, maxVerifyFails)
+				s.logger.Warnf("app=%s: verify-fail cap reached (%d) — SUSPENDED; not respawning until daemon restart or re-install", a.Manifest.ID, maxVerifyFails)
 				s.writeAuditLine(a, auditEvent{Event: "suspend", Reason: fmt.Sprintf(">=%d consecutive verify failures", maxVerifyFails)})
 				markerPath := filepath.Join(a.Dir, suspendedMarkerName)
 				if err := os.WriteFile(markerPath, nil, 0o600); err != nil {
-					s.logger.Printf("app=%s: write suspended marker: %v", a.Manifest.ID, err)
+					s.logger.Warnf("app=%s: write suspended marker: %v", a.Manifest.ID, err)
 				}
 				s.markSuspended(a.Manifest.ID)
 				return
@@ -1018,8 +1061,22 @@ func (s *supervisor) superviseOne(ctx context.Context, a *installedApp) {
 		if ctx.Err() != nil {
 			return
 		}
+		if s.takeReinstalled(a.Manifest.ID) {
+			// Stopped by watchSocket because pilotctl replaced the install:
+			// not a crash. An upgrade's rescan cancels this goroutine and
+			// starts the new version; give it one rescan to do so, rather
+			// than verifying the new binary against this manifest's pin.
+			// A reinstall of the same bundle is restarted here.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(s.rescanInterval() + time.Second):
+			}
+			backoff = time.Second
+			continue
+		}
 		if suspended := s.recordCrash(a.Manifest.ID); suspended {
-			s.logger.Printf("app=%s exited (code=%d) — SUSPENDED (>%d crashes in %s); not respawning until daemon restart",
+			s.logger.Warnf("app=%s exited (code=%d) — SUSPENDED (>%d crashes in %s); not respawning until daemon restart",
 				a.Manifest.ID, exitCode, maxCrashesInWindow, crashLoopWindow)
 			s.writeAuditLine(a, auditEvent{Event: "suspend", Reason: fmt.Sprintf(">%d crashes in %s", maxCrashesInWindow, crashLoopWindow)})
 			// Drop a sentinel file so `pilotctl appstore list` (which
@@ -1029,11 +1086,11 @@ func (s *supervisor) superviseOne(ctx context.Context, a *installedApp) {
 			// log still records the event canonically.
 			markerPath := filepath.Join(a.Dir, suspendedMarkerName)
 			if err := os.WriteFile(markerPath, nil, 0o600); err != nil {
-				s.logger.Printf("app=%s: write suspended marker: %v", a.Manifest.ID, err)
+				s.logger.Warnf("app=%s: write suspended marker: %v", a.Manifest.ID, err)
 			}
 			return
 		}
-		s.logger.Printf("app=%s exited (code=%d) — restart in %s", a.Manifest.ID, exitCode, backoff)
+		s.logger.Warnf("app=%s exited (code=%d) — restart in %s", a.Manifest.ID, exitCode, backoff)
 		select {
 		case <-ctx.Done():
 			return
@@ -1096,7 +1153,7 @@ func (s *supervisor) spawn(ctx context.Context, a *installedApp) int {
 	// verified at the top of its cycle, but a swap could land in the
 	// window between that check and this exec — refuse to launch if so.
 	if err := s.verifyAtSpawn(a); err != nil {
-		s.logger.Printf("app=%s: spawn-time verify failed: %v — refusing to exec", a.Manifest.ID, err)
+		s.logger.Warnf("app=%s: spawn-time verify failed: %v — refusing to exec", a.Manifest.ID, err)
 		s.writeAuditLine(a, auditEvent{Event: "verify-fail", Reason: "spawn-time: " + err.Error(), SHA256: a.Manifest.Binary.SHA256, BinaryAt: a.BinaryPath})
 		return -1
 	}
@@ -1154,7 +1211,7 @@ func (s *supervisor) spawn(ctx context.Context, a *installedApp) int {
 		defer runtime.UnlockOSThread()
 	}
 	if err := cmd.Start(); err != nil {
-		s.logger.Printf("app=%s start: %v", a.Manifest.ID, err)
+		s.logger.Warnf("app=%s start: %v", a.Manifest.ID, err)
 		s.writeAuditLine(a, auditEvent{Event: "spawn-fail", Reason: err.Error(), BinaryAt: a.BinaryPath})
 		return -1
 	}
@@ -1205,7 +1262,7 @@ func (s *supervisor) waitReady(ctx context.Context, a *installedApp, timeout tim
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	s.logger.Printf("app=%s socket did not appear within %s", a.Manifest.ID, timeout)
+	s.logger.Warnf("app=%s socket did not appear within %s", a.Manifest.ID, timeout)
 }
 
 func (s *supervisor) markReady(appID string) {
@@ -1401,7 +1458,7 @@ func (s *supervisor) emitUsage(callerID, appID, method string, ok bool, durMs in
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			s.logger.Printf("telemetry emitter panicked: %v", r)
+			s.logger.Warnf("telemetry emitter panicked: %v", r)
 		}
 	}()
 	t.Emit(TelemetryEvent{
