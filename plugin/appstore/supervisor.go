@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -170,11 +171,12 @@ type supervisor struct {
 	crashes   map[string]*crashRecord       // app_id → sliding-window crash counter
 	appCancel map[string]context.CancelFunc // app_id → cancel its per-app context (used to stop a supervise goroutine on detected uninstall)
 
-	// sigMu guards sigFails. Kept separate from mu because the
-	// signature-failure bookkeeping happens inside scanInstalled, which
-	// must not hold the main lock while walking the filesystem.
+	// sigMu guards sigFails and misnamed. Kept separate from mu because
+	// this bookkeeping happens inside scanInstalled, which must not hold
+	// the main lock while walking the filesystem.
 	sigMu    sync.Mutex
 	sigFails map[string]*sigFailRecord // install-dir name → manifest-signature failure state
+	misnamed map[string]bool           // install-dir names skipped (and logged) because they are not their manifest's app ID
 }
 
 func newSupervisor(cfg Config, deps Deps, logger *log.Logger) *supervisor {
@@ -191,13 +193,14 @@ func newSupervisor(cfg Config, deps Deps, logger *log.Logger) *supervisor {
 		crashes:   map[string]*crashRecord{},
 		appCancel: map[string]context.CancelFunc{},
 		sigFails:  map[string]*sigFailRecord{},
+		misnamed:  map[string]bool{},
 	}
 }
 
 // crashLoopWindow + maxCrashesInWindow define when an app is judged to
 // be stuck in a crash-loop. Exceed the cap and the supervisor stops
-// respawning until either the daemon restarts or a future
-// pilotctl-driven "appstore restart" command clears the suspended bit.
+// respawning until the daemon restarts, or the app is upgraded or
+// reinstalled (the rescan then starts it with a clean record).
 const (
 	crashLoopWindow    = 60 * time.Second
 	maxCrashesInWindow = 5
@@ -399,10 +402,46 @@ func (s *supervisor) clearSignatureFailure(dirName, appID string) {
 	}
 }
 
+// noteMisnamed logs the install dirs one scan skipped because their name is
+// not their manifest's app ID (skipped maps dir name → app ID; present holds
+// every dir name in the scan). Each dir is logged once, not on every rescan
+// tick; a name absent from this scan is forgotten, so a dir that comes back
+// later (the next install's staging dir) is logged again.
+//
+// An <id>.previous with no <id> beside it is an install interrupted mid-swap:
+// the app is no longer running, so that line says how to restore it.
+func (s *supervisor) noteMisnamed(skipped map[string]string, present map[string]bool) {
+	s.sigMu.Lock()
+	var fresh []string
+	for name := range skipped {
+		if !s.misnamed[name] {
+			fresh = append(fresh, name)
+		}
+	}
+	s.misnamed = make(map[string]bool, len(skipped))
+	for name := range skipped {
+		s.misnamed[name] = true
+	}
+	s.sigMu.Unlock()
+
+	sort.Strings(fresh)
+	for _, name := range fresh {
+		id := skipped[name]
+		if strings.HasPrefix(name, id+".previous") && !present[id] {
+			s.logger.Printf("skip %s: app %s is not installed, and this is its previous install, left by an install that did not finish — run `pilotctl appstore install %s` to restore it", name, id, id)
+			continue
+		}
+		s.logger.Printf("skip %s: dir name is not its app id %s (an install's staging or replaced dir) — not adopting", name, id)
+	}
+}
+
 // scanInstalled walks InstallRoot, reads each `<app>/manifest.json`, and
 // returns the verified-by-syntax set. Sha256 verification is per-launch
 // (in run()), not per-scan, so a corrupted binary surfaces at the right
 // time.
+//
+// Only `<InstallRoot>/<id>` is an install: a dir whose name is not its
+// manifest's ID is skipped (see the check after Validate).
 func (s *supervisor) scanInstalled() ([]*installedApp, error) {
 	entries, err := os.ReadDir(s.cfg.InstallRoot)
 	if err != nil {
@@ -412,6 +451,7 @@ func (s *supervisor) scanInstalled() ([]*installedApp, error) {
 		return nil, err
 	}
 	var out []*installedApp
+	misnamed := map[string]string{} // dir name → app ID, for noteMisnamed
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
@@ -430,6 +470,18 @@ func (s *supervisor) scanInstalled() ([]*installedApp, error) {
 		}
 		if errs := m.Validate(); len(errs) != 0 {
 			s.logger.Printf("skip %s: invalid manifest: %v", e.Name(), errs[0])
+			continue
+		}
+		// Only <InstallRoot>/<id> is an install. pilotctl's install leaves
+		// <id>.staging (from the manifest write to the swap) and
+		// <id>.previous (from the swap until it is retired) beside it, both
+		// holding a valid manifest for the same app. Adopting one gave the
+		// app a second supervisor: on a rescan it "rebuilt" the app from
+		// the old copy, the two overwrote each other's appCancel entry and
+		// reaped each other's process until the app was suspended, and at
+		// daemon start it ran beside the live install.
+		if e.Name() != m.ID {
+			misnamed[e.Name()] = m.ID
 			continue
 		}
 		// Sideload detection: presence of `.sideloaded` in the install
@@ -513,6 +565,11 @@ func (s *supervisor) scanInstalled() ([]*installedApp, error) {
 			Sideloaded: sideloaded,
 		})
 	}
+	present := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		present[e.Name()] = true
+	}
+	s.noteMisnamed(misnamed, present)
 	return out, nil
 }
 
@@ -683,6 +740,12 @@ func (s *supervisor) rescanForNew() []*installedApp {
 				BinaryAt: a.BinaryPath,
 			})
 		}
+		// A new install or version starts with a clean crash-loop record.
+		// Records are keyed by app ID, so keeping it would leave v2
+		// suspended because v1 crash-looped (recordCrash's suspended bit is
+		// sticky). The .suspended marker is removed by superviseOne when it
+		// starts.
+		delete(s.crashes, a.Manifest.ID)
 		s.installed[a.Manifest.ID] = a
 		fresh = append(fresh, a)
 		s.logger.Printf("rescan: discovered new app id=%s dir=%s", a.Manifest.ID, a.Dir)
@@ -717,6 +780,9 @@ func (s *supervisor) rescanForGone() {
 		}
 		delete(s.installed, id)
 		delete(s.ready, id)
+		// The crash record goes with the install, so a reinstall under the
+		// same ID does not come back suspended.
+		delete(s.crashes, id)
 		s.logger.Printf("rescan: app id=%s removed from disk; supervise goroutine canceled", id)
 	}
 }
