@@ -177,6 +177,10 @@ func (s *supervisor) watchSocket(ctx context.Context, a *installedApp, pid int, 
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	seen := false
+	// The install dir as it was when this process started. pilotctl's
+	// install swaps in a new dir under the same path, which takes the
+	// socket path with it: that is a reinstall, not a lost socket.
+	origDir, _ := os.Stat(a.Dir)
 	for {
 		select {
 		case <-ctx.Done():
@@ -193,8 +197,14 @@ func (s *supervisor) watchSocket(ctx context.Context, a *installedApp, pid int, 
 		case err == nil:
 			seen = true
 		case seen && os.IsNotExist(err):
-			s.logger.Warnf("app=%s: socket %s vanished while pid=%d is running — restarting it", a.Manifest.ID, a.SocketPath, pid)
-			s.writeAuditLine(a, auditEvent{Event: "socket-lost", PID: pid})
+			if cur, cerr := os.Stat(a.Dir); origDir != nil && cerr == nil && !os.SameFile(origDir, cur) {
+				s.logger.Printf("app=%s: reinstalled while running (pid=%d) — restarting it into the new install", a.Manifest.ID, pid)
+				s.writeAuditLine(a, auditEvent{Event: "reinstalled", PID: pid})
+				s.markReinstalled(a.Manifest.ID)
+			} else {
+				s.logger.Warnf("app=%s: socket %s vanished while pid=%d is running — restarting it", a.Manifest.ID, a.SocketPath, pid)
+				s.writeAuditLine(a, auditEvent{Event: "socket-lost", PID: pid})
+			}
 			if syscall.Kill(-pid, syscall.SIGTERM) != nil {
 				_ = syscall.Kill(pid, syscall.SIGTERM)
 			}

@@ -87,6 +87,9 @@ func (s *supervisor) writeAuditLine(a *installedApp, ev auditEvent) {
 	path := filepath.Join(a.Dir, supervisorLogName)
 	s.rotateAuditIfLarge(a.Dir)
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if errors.Is(err, fs.ErrNotExist) {
+		return // the app's dir is gone: it was uninstalled
+	}
 	if err != nil {
 		s.logger.Warnf("audit open %s: %v", path, err)
 		return
@@ -172,12 +175,18 @@ type supervisor struct {
 	crashes   map[string]*crashRecord       // app_id → sliding-window crash counter
 	appCancel map[string]context.CancelFunc // app_id → cancel its per-app context (used to stop a supervise goroutine on detected uninstall)
 
-	// sigMu guards sigFails and misnamed. Kept separate from mu because
+	// sigMu guards sigFails, skipLogged and warned. Kept separate from mu because
 	// this bookkeeping happens inside scanInstalled, which must not hold
 	// the main lock while walking the filesystem.
 	sigMu      sync.Mutex
 	sigFails   map[string]*sigFailRecord // install-dir name → manifest-signature failure state
 	skipLogged map[string]string         // install-dir name → the skip line last logged for it (noteSkipped)
+	warned     map[string]string         // condition key → the warning last logged for it (warnOnce)
+
+	// reinstalled marks an app whose running process watchSocket stopped
+	// because its install dir was replaced (pilotctl reinstalled it): its
+	// exit is not a crash. Guarded by mu.
+	reinstalled map[string]bool
 }
 
 func newSupervisor(cfg Config, deps Deps, logger *log.Logger) *supervisor {
@@ -186,15 +195,17 @@ func newSupervisor(cfg Config, deps Deps, logger *log.Logger) *supervisor {
 		deps.Telemetry = noopEmitter{}
 	}
 	return &supervisor{
-		cfg:        cfg,
-		deps:       deps,
-		logger:     newAppLogger(logger, cfg.Slog),
-		installed:  map[string]*installedApp{},
-		ready:      map[string]bool{},
-		crashes:    map[string]*crashRecord{},
-		appCancel:  map[string]context.CancelFunc{},
-		sigFails:   map[string]*sigFailRecord{},
-		skipLogged: map[string]string{},
+		cfg:         cfg,
+		deps:        deps,
+		logger:      newAppLogger(logger, cfg.Slog),
+		installed:   map[string]*installedApp{},
+		ready:       map[string]bool{},
+		crashes:     map[string]*crashRecord{},
+		appCancel:   map[string]context.CancelFunc{},
+		sigFails:    map[string]*sigFailRecord{},
+		skipLogged:  map[string]string{},
+		warned:      map[string]string{},
+		reinstalled: map[string]bool{},
 	}
 }
 
@@ -476,7 +487,7 @@ func (s *supervisor) scanInstalled() ([]*installedApp, error) {
 		dir := filepath.Join(s.cfg.InstallRoot, e.Name())
 		mfPath := filepath.Join(dir, "manifest.json")
 		data, err := os.ReadFile(mfPath)
-		if errors.Is(err, fs.ErrNotExist) {
+		if _, lerr := os.Lstat(mfPath); errors.Is(err, fs.ErrNotExist) && errors.Is(lerr, fs.ErrNotExist) {
 			// Not an install: an app run outside the daemon can keep its
 			// state under its id here (the wallet's identity-evm.json).
 			skipped[e.Name()] = skipNote{msg: fmt.Sprintf("skip %s: no manifest.json — not an installed app; left alone", e.Name())}
@@ -703,9 +714,10 @@ func (s *supervisor) run(ctx context.Context, apps []*installedApp) {
 func (s *supervisor) rescanForNew() []*installedApp {
 	apps, err := s.scanInstalled()
 	if err != nil {
-		s.logger.Warnf("rescan: %v", err)
+		s.warnOnce("rescan", fmt.Sprintf("rescan: %v", err))
 		return nil
 	}
+	s.clearWarned("rescan")
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var fresh []*installedApp
@@ -742,12 +754,16 @@ func (s *supervisor) rescanForNew() []*installedApp {
 				continue
 			}
 			if compareVersions(a.Manifest.AppVersion, existing.Manifest.AppVersion) < 0 {
-				s.logger.Warnf("rescan: downgrade refused: app=%s new=%s old=%s — keeping existing version",
-					a.Manifest.ID, a.Manifest.AppVersion, existing.Manifest.AppVersion)
-				s.writeAuditLine(a, auditEvent{Event: "downgrade-refused",
-					Reason: fmt.Sprintf("rescan: refusing %s (existing %s)", a.Manifest.AppVersion, existing.Manifest.AppVersion)})
+				// The older install stays on disk, so every rescan finds it
+				// again: say so once per version and binary on disk.
+				if s.warnOnce("downgrade/"+a.Manifest.ID, fmt.Sprintf("rescan: downgrade refused: app=%s new=%s (%s) old=%s — keeping existing version",
+					a.Manifest.ID, a.Manifest.AppVersion, shortSHA(a.Manifest.Binary.SHA256), existing.Manifest.AppVersion)) {
+					s.writeAuditLine(a, auditEvent{Event: "downgrade-refused",
+						Reason: fmt.Sprintf("rescan: refusing %s (existing %s)", a.Manifest.AppVersion, existing.Manifest.AppVersion)})
+				}
 				continue
 			}
+			s.clearWarned("downgrade/" + a.Manifest.ID)
 			// Version upgrade detected on disk: cancel the old supervise
 			// goroutine and register the new manifest. The old app
 			// will be torn down by its ctx cancel; the rescan loop
@@ -853,9 +869,10 @@ func (s *supervisor) rescanForResume() []*installedApp {
 		}
 		// Consume the marker first so a partial failure doesn't loop.
 		if err := os.Remove(markerPath); err != nil {
-			s.logger.Warnf("rescan: app id=%s: remove resume marker: %v", id, err)
+			s.warnOnce("resume/"+id, fmt.Sprintf("rescan: app id=%s: remove resume marker: %v", id, err))
 			continue
 		}
+		s.clearWarned("resume/" + id)
 		// Clear the crash record so the new supervise goroutine
 		// starts with a fresh window. Also drop the stale cancel —
 		// the old goroutine has already returned (suspended apps
@@ -1043,6 +1060,20 @@ func (s *supervisor) superviseOne(ctx context.Context, a *installedApp) {
 		s.writeAuditLine(a, auditEvent{Event: "exit", ExitCode: exitCode})
 		if ctx.Err() != nil {
 			return
+		}
+		if s.takeReinstalled(a.Manifest.ID) {
+			// Stopped by watchSocket because pilotctl replaced the install:
+			// not a crash. An upgrade's rescan cancels this goroutine and
+			// starts the new version; give it one rescan to do so, rather
+			// than verifying the new binary against this manifest's pin.
+			// A reinstall of the same bundle is restarted here.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(s.rescanInterval() + time.Second):
+			}
+			backoff = time.Second
+			continue
 		}
 		if suspended := s.recordCrash(a.Manifest.ID); suspended {
 			s.logger.Warnf("app=%s exited (code=%d) — SUSPENDED (>%d crashes in %s); not respawning until daemon restart",
