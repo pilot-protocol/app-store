@@ -728,6 +728,11 @@ func (s *supervisor) rescanForNew() []*installedApp {
 				BinaryAt: a.BinaryPath,
 			})
 		}
+		// A new install or version starts with a clean crash-loop record.
+		// Records are keyed by app ID, so keeping it suspended a v2 because
+		// v1 crash-looped (recordCrash's suspended bit is sticky). The
+		// .suspended marker is removed by superviseOne when it starts.
+		delete(s.crashes, a.Manifest.ID)
 		s.installed[a.Manifest.ID] = a
 		fresh = append(fresh, a)
 		s.logger.Printf("rescan: discovered new app id=%s dir=%s", a.Manifest.ID, a.Dir)
@@ -762,6 +767,9 @@ func (s *supervisor) rescanForGone() {
 		}
 		delete(s.installed, id)
 		delete(s.ready, id)
+		// The crash record goes with the install, so a reinstall under the
+		// same ID does not come back suspended.
+		delete(s.crashes, id)
 		s.logger.Printf("rescan: app id=%s removed from disk; supervise goroutine canceled", id)
 	}
 }
