@@ -3,7 +3,6 @@
 package appstore
 
 import (
-	"log"
 	"sync"
 )
 
@@ -18,8 +17,8 @@ var resourceLimitWarning sync.Once
 //
 // The addrSpaceLimit parameter is accepted for signature parity with the
 // Linux build and ignored here.
-func applyChildResourceLimits(pid int, addrSpaceLimit uint64, logger *log.Logger) {
+func applyChildResourceLimits(pid int, addrSpaceLimit uint64, logger *appLogger) {
 	resourceLimitWarning.Do(func() {
-		logger.Print("resource limits not enforced on this platform (linux-only); child file-descriptor and address-space caps are ignored")
+		logger.Printf("resource limits not enforced on this platform (linux-only); child file-descriptor and address-space caps are ignored")
 	})
 }

@@ -193,7 +193,7 @@ func (s *supervisor) watchSocket(ctx context.Context, a *installedApp, pid int, 
 		case err == nil:
 			seen = true
 		case seen && os.IsNotExist(err):
-			s.logger.Printf("app=%s: socket %s vanished while pid=%d is running — restarting it", a.Manifest.ID, a.SocketPath, pid)
+			s.logger.Warnf("app=%s: socket %s vanished while pid=%d is running — restarting it", a.Manifest.ID, a.SocketPath, pid)
 			s.writeAuditLine(a, auditEvent{Event: "socket-lost", PID: pid})
 			if syscall.Kill(-pid, syscall.SIGTERM) != nil {
 				_ = syscall.Kill(pid, syscall.SIGTERM)

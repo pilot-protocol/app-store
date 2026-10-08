@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -53,6 +54,12 @@ type Config struct {
 	// Logger optionally redirects internal messages. When nil the
 	// service logs via the standard log package.
 	Logger *log.Logger
+
+	// Slog, when set, receives the messages instead of Logger, with a
+	// level: INFO for routine ones, WARN for problems an operator may need
+	// to act on. The daemon passes its own logger, so these lines read and
+	// filter like the rest of its log.
+	Slog *slog.Logger
 
 	// RescanInterval controls how often the supervisor re-walks
 	// InstallRoot looking for newly-landed apps (e.g. dropped by
@@ -106,7 +113,7 @@ func catalogPubkeyIsPlaceholder(pk []byte) bool {
 // Service implements coreapi.Service for the app store.
 type Service struct {
 	cfg     Config
-	logger  *log.Logger
+	logger  *appLogger
 	sup     *supervisor // started in Start; nil before then
 	cancel  context.CancelFunc
 	doneCh  chan struct{}
@@ -125,11 +132,11 @@ func NewService(cfg Config) *Service {
 	if cfg.CatalogPubkey == nil {
 		cfg.CatalogPubkey = EmbeddedCatalogPubkey
 	}
-	logger := cfg.Logger
-	if logger == nil {
-		logger = log.New(os.Stderr, "appstore ", log.LstdFlags|log.Lmicroseconds)
+	std := cfg.Logger
+	if std == nil {
+		std = log.New(os.Stderr, "appstore ", log.LstdFlags|log.Lmicroseconds)
 	}
-	return &Service{cfg: cfg, logger: logger}
+	return &Service{cfg: cfg, logger: newAppLogger(std, cfg.Slog)}
 }
 
 // Name returns the plugin identifier reported to the runtime registry.
@@ -187,14 +194,14 @@ func (s *Service) Start(ctx context.Context, deps Deps) error {
 	// operator catch a misbuilt release before any user-visible
 	// install completes.
 	if catalogPubkeyIsPlaceholder(s.cfg.CatalogPubkey) {
-		s.logger.Printf("WARNING: dev-mode trust anchor — CatalogPubkey is the all-zeros placeholder; signed catalogs will NOT verify. Replace EmbeddedCatalogPubkey for production builds.")
+		s.logger.Warnf("WARNING: dev-mode trust anchor — CatalogPubkey is the all-zeros placeholder; signed catalogs will NOT verify. Replace EmbeddedCatalogPubkey for production builds.")
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
 	s.doneCh = make(chan struct{})
 
-	s.sup = newSupervisor(s.cfg, deps, s.logger)
+	s.sup = newSupervisor(s.cfg, deps, s.logger.std)
 	apps, err := s.sup.scanInstalled()
 	if err != nil {
 		cancel()
@@ -227,7 +234,7 @@ func (s *Service) Stop(ctx context.Context) error {
 		s.sup = nil
 		return nil
 	case <-ctx.Done():
-		s.logger.Printf("stop: ctx deadline reached before drain")
+		s.logger.Warnf("stop: ctx deadline reached before drain")
 		return ctx.Err()
 	}
 }

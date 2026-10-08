@@ -43,7 +43,7 @@ func TestApplyChildResourceLimits_SetsAddressSpace(t *testing.T) {
 	cmd := startSleeper(t)
 	pid := cmd.Process.Pid
 	const limit uint64 = 2 << 30
-	applyChildResourceLimits(pid, limit, newQuietLogger(t))
+	applyChildResourceLimits(pid, limit, newAppLogger(newQuietLogger(t), nil))
 
 	if got := getChildRlimit(t, pid, syscall.RLIMIT_AS); got.Cur != limit {
 		t.Errorf("RLIMIT_AS Cur = %d, want %d", got.Cur, limit)
@@ -59,7 +59,7 @@ func TestApplyChildResourceLimits_ZeroSkipsAddressSpace(t *testing.T) {
 	cmd := startSleeper(t)
 	pid := cmd.Process.Pid
 	before := getChildRlimit(t, pid, syscall.RLIMIT_AS)
-	applyChildResourceLimits(pid, 0, newQuietLogger(t))
+	applyChildResourceLimits(pid, 0, newAppLogger(newQuietLogger(t), nil))
 	after := getChildRlimit(t, pid, syscall.RLIMIT_AS)
 	if after.Cur != before.Cur {
 		t.Errorf("RLIMIT_AS changed despite zero limit: before=%d after=%d", before.Cur, after.Cur)
