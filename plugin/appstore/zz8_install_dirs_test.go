@@ -135,3 +135,42 @@ func TestScanInstalled_SkipsDirNotNamedForItsApp(t *testing.T) {
 		t.Errorf("copy-of-test-app logged %d times after it came back, want 2:\n%s", n, logs.String())
 	}
 }
+
+// An install interrupted after it renamed <id> to <id>.previous and before
+// it renamed <id>.staging to <id> leaves no <id>: the app is not adopted and
+// stops running. The skip line says so and how to restore it; beside a live
+// <id> it stays the plain skip line.
+func TestScanInstalled_PreviousWithoutLiveSaysHowToRestore(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	const id = "io.test.app"
+	sha := strings.Repeat("a", 64)
+	writeAppDirAt(t, root, id+".previous", id, "1.0.0", sha)
+	writeAppDirAt(t, root, id+".staging", id, "1.0.1", sha)
+
+	var logs bytes.Buffer
+	sup := newSupervisor(Config{InstallRoot: root, CataloguePublisher: testCatPub}, Deps{}, log.New(&logs, "", 0))
+	if apps, err := sup.scanInstalled(); err != nil || len(apps) != 0 {
+		t.Fatalf("scanInstalled = %d apps, %v; want none", len(apps), err)
+	}
+	restore := "run `pilotctl appstore install " + id + "` to restore it"
+	if !strings.Contains(logs.String(), "skip "+id+".previous: app "+id+" is not installed") || !strings.Contains(logs.String(), restore) {
+		t.Errorf("no restore hint for a .previous without its app:\n%s", logs.String())
+	}
+	if strings.Count(logs.String(), restore) != 1 {
+		t.Errorf("restore hint not once (the staging dir must not get it):\n%s", logs.String())
+	}
+
+	// With the live dir back, a later .previous is the ordinary skip.
+	logs.Reset()
+	root2 := t.TempDir()
+	writeAppDirWithVersionSHA(t, root2, id, "1.0.0", sha)
+	writeAppDirAt(t, root2, id+".previous", id, "1.0.0", sha)
+	sup2 := newSupervisor(Config{InstallRoot: root2, CataloguePublisher: testCatPub}, Deps{}, log.New(&logs, "", 0))
+	if _, err := sup2.scanInstalled(); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(logs.String(), "restore it") || !strings.Contains(logs.String(), "not adopting") {
+		t.Errorf("a .previous beside its live app got the restore hint:\n%s", logs.String())
+	}
+}

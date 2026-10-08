@@ -199,8 +199,8 @@ func newSupervisor(cfg Config, deps Deps, logger *log.Logger) *supervisor {
 
 // crashLoopWindow + maxCrashesInWindow define when an app is judged to
 // be stuck in a crash-loop. Exceed the cap and the supervisor stops
-// respawning until either the daemon restarts or a future
-// pilotctl-driven "appstore restart" command clears the suspended bit.
+// respawning until the daemon restarts, or the app is upgraded or
+// reinstalled (the rescan then starts it with a clean record).
 const (
 	crashLoopWindow    = 60 * time.Second
 	maxCrashesInWindow = 5
@@ -403,11 +403,14 @@ func (s *supervisor) clearSignatureFailure(dirName, appID string) {
 }
 
 // noteMisnamed logs the install dirs one scan skipped because their name is
-// not their manifest's app ID (skipped maps dir name → app ID). Each dir is
-// logged once, not on every rescan tick; a name absent from this scan is
-// forgotten, so a dir that comes back later (the next install's staging dir)
-// is logged again.
-func (s *supervisor) noteMisnamed(skipped map[string]string) {
+// not their manifest's app ID (skipped maps dir name → app ID; present holds
+// every dir name in the scan). Each dir is logged once, not on every rescan
+// tick; a name absent from this scan is forgotten, so a dir that comes back
+// later (the next install's staging dir) is logged again.
+//
+// An <id>.previous with no <id> beside it is an install interrupted mid-swap:
+// the app is no longer running, so that line says how to restore it.
+func (s *supervisor) noteMisnamed(skipped map[string]string, present map[string]bool) {
 	s.sigMu.Lock()
 	var fresh []string
 	for name := range skipped {
@@ -423,7 +426,12 @@ func (s *supervisor) noteMisnamed(skipped map[string]string) {
 
 	sort.Strings(fresh)
 	for _, name := range fresh {
-		s.logger.Printf("skip %s: dir name is not its app id %s (an install's staging or replaced dir) — not adopting", name, skipped[name])
+		id := skipped[name]
+		if strings.HasPrefix(name, id+".previous") && !present[id] {
+			s.logger.Printf("skip %s: app %s is not installed, and this is its previous install, left by an install that did not finish — run `pilotctl appstore install %s` to restore it", name, id, id)
+			continue
+		}
+		s.logger.Printf("skip %s: dir name is not its app id %s (an install's staging or replaced dir) — not adopting", name, id)
 	}
 }
 
@@ -557,7 +565,11 @@ func (s *supervisor) scanInstalled() ([]*installedApp, error) {
 			Sideloaded: sideloaded,
 		})
 	}
-	s.noteMisnamed(misnamed)
+	present := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		present[e.Name()] = true
+	}
+	s.noteMisnamed(misnamed, present)
 	return out, nil
 }
 
@@ -729,9 +741,10 @@ func (s *supervisor) rescanForNew() []*installedApp {
 			})
 		}
 		// A new install or version starts with a clean crash-loop record.
-		// Records are keyed by app ID, so keeping it suspended a v2 because
-		// v1 crash-looped (recordCrash's suspended bit is sticky). The
-		// .suspended marker is removed by superviseOne when it starts.
+		// Records are keyed by app ID, so keeping it would leave v2
+		// suspended because v1 crash-looped (recordCrash's suspended bit is
+		// sticky). The .suspended marker is removed by superviseOne when it
+		// starts.
 		delete(s.crashes, a.Manifest.ID)
 		s.installed[a.Manifest.ID] = a
 		fresh = append(fresh, a)
